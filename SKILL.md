@@ -16,10 +16,11 @@ metadata:
 
 优先按以下顺序判断：
 1. 用户明确要求"测试浏览器 / 启动浏览器 / 检查登录 / 只打开不发布"：进入测试浏览器流程。
-2. 用户已提供 `标题 + 正文 + 视频(本地路径或URL)`：直接进入视频发布流程。
-3. 用户已提供 `标题 + 正文 + 图片(本地路径或URL)`：直接进入图文发布流程。
-4. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
-5. 信息不全：先补齐缺失信息，不要直接发布。
+2. 用户要求“搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表”：进入内容检索流程（`search-feeds` / `get-feed-detail` / `content-data`）。
+3. 用户已提供 `标题 + 正文 + 视频(本地路径或URL)`：直接进入视频发布流程。
+4. 用户已提供 `标题 + 正文 + 图片(本地路径或URL)`：直接进入图文发布流程。
+5. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
+6. 信息不全：先补齐缺失信息，不要直接发布。
 
 ## 必做约束
 
@@ -52,36 +53,60 @@ metadata:
 3. 执行视频发布命令（默认无头）。视频上传后需等待处理完成。
 4. 回传执行结果（成功/失败 + 关键信息）。
 
+## 内容检索流程（搜索/详情/内容数据）
+
+1. 先检查小红书主页登录状态（`XHS_HOME_URL`，非创作者中心）。
+2. 执行 `search-feeds` 获取笔记列表。
+3. 若用户需要详情，从搜索结果中取 `id` + `xsecToken` 再执行 `get-feed-detail`。
+4. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
+5. 回传结构化结果（数量、核心字段、链接）。
+
 ## 常用命令
+
+### 参数顺序提醒（`cdp_publish.py` / `publish_pipeline.py`）
+
+请严格按下面顺序写命令，避免 `unrecognized arguments`：
+
+- 全局参数放在子命令前：`--host --port --headless --account --timing-jitter --reuse-existing-tab`
+- 子命令参数放在子命令后：如 `search-feeds` 的 `--keyword --sort-by --note-type`
+
+示例（正确）：
+
+```bash
+python scripts/cdp_publish.py --reuse-existing-tab search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
+```
 
 ### 0) 启动 / 测试浏览器（不发布）
 
-默认调试端口为 `9222`，可通过 `--port` 自定义（如 `9223`）。
+默认 CDP 地址为 `127.0.0.1:9222`，可通过 `--host` / `--port` 指定（例如 `10.0.0.12:9222`）。
 
 ```bash
 # 启动测试浏览器（有窗口，推荐）
 python scripts/chrome_launcher.py
 
-# 指定端口启动（例如 9223）
+# 可选-指定端口启动（默认端口为 9222）
 python scripts/chrome_launcher.py --port 9223
 
-# 无头启动测试浏览器
+# 可选-无头启动测试浏览器
 python scripts/chrome_launcher.py --headless
 
-# 指定端口 + 无头
+# 可选-指定端口 + 无头
 python scripts/chrome_launcher.py --headless --port 9223
 
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
-python scripts/cdp_publish.py check-login --reuse-existing-tab
+python scripts/cdp_publish.py --reuse-existing-tab check-login
 
 # 指定端口检查登录
-python scripts/cdp_publish.py --port 9223 check-login
+python scripts/cdp_publish.py --port 9222 check-login
 
 # 指定端口 + 优先复用已有标签页
-python scripts/cdp_publish.py --port 9223 check-login --reuse-existing-tab
+python scripts/cdp_publish.py --port 9222 --reuse-existing-tab check-login
+
+# 连接远程 CDP 检查登录（远程 Chrome 需已开启调试端口）
+python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
 
 # 重启测试浏览器
 python scripts/chrome_launcher.py --restart
@@ -103,42 +128,50 @@ python scripts/cdp_publish.py login
 
 # 指定端口登录
 python scripts/cdp_publish.py --port 9223 login
+
+# 远程 CDP 登录（不会自动重启远程 Chrome）
+python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 login
 ```
 
 ### 2) 无头发布 or 有头发布（推荐有窗口发布） 图片 url
 
 ```bash
 python scripts/publish_pipeline.py --headless \
-  --port 9223 \
   --title-file title.txt \
   --content-file content.txt \
   --image-urls "URL1" "URL2"
 ```
 
 ```bash
-python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
+python scripts/publish_pipeline.py  --title-file title.txt \
   --content-file content.txt \
   --image-urls "URL1" "URL2"
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
-python scripts/publish_pipeline.py --port 9223 --reuse-existing-tab --title-file title.txt \
+python scripts/publish_pipeline.py  --reuse-existing-tab --title-file title.txt \
+  --content-file content.txt \
+  --image-urls "URL1" "URL2"
+
+# 远程 CDP 发布（远程 Chrome 需预先启动并可访问）
+python scripts/publish_pipeline.py --host 10.0.0.12 --title-file title.txt \
   --content-file content.txt \
   --image-urls "URL1" "URL2"
 ```
+
+远程模式说明：当 `--host` 不是 `127.0.0.1/localhost` 时，脚本会跳过本地 `chrome_launcher.py` 的自动启动/重启逻辑。
 
 
 ### 3) 无头发布 or 有头发布  使用本地图片发布
 
 ```bash
 python scripts/publish_pipeline.py --headless \
-  --port 9223 \
   --title-file title.txt \
   --content-file content.txt \
   --images "./images/pic1.jpg" "./images/pic2.jpg"
 ```
 
 ```bash
-python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
+python scripts/publish_pipeline.py  --title-file title.txt \
   --content-file content.txt \
   --images "./images/pic1.jpg" "./images/pic2.jpg"
 ```
@@ -147,14 +180,14 @@ python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
 
 ```bash
 python scripts/publish_pipeline.py --headless \
-  --port 9223 \
+
   --title-file title.txt \
   --content-file content.txt \
   --video "C:/videos/my_video.mp4"
 ```
 
 ```bash
-python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
+python scripts/publish_pipeline.py  --title-file title.txt \
   --content-file content.txt \
   --video "C:/videos/my_video.mp4"
 ```
@@ -163,14 +196,14 @@ python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
 
 ```bash
 python scripts/publish_pipeline.py --headless \
-  --port 9223 \
+
   --title-file title.txt \
   --content-file content.txt \
   --video-url "https://example.com/video.mp4"
 ```
 
 ```bash
-python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
+python scripts/publish_pipeline.py  --title-file title.txt \
   --content-file content.txt \
   --video-url "https://example.com/video.mp4"
 ```
@@ -189,12 +222,39 @@ python scripts/publish_pipeline.py --port 9223 --account work --headless --title
 ```bash
 # 发布后自动点赞和收藏
 python scripts/publish_pipeline.py --headless \
-  --port 9223 \
   --title-file title.txt \
   --content-file content.txt \
   --image-urls "URL1" "URL2" \
   --auto-publish \
   --auto-like-collect
+```
+
+### 6) 搜索内容 / 获取笔记详情
+
+```bash
+# 搜索笔记
+python scripts/cdp_publish.py search-feeds --keyword "春招"
+
+# 可选：带筛选搜索
+python scripts/cdp_publish.py --reuse-existing-tab search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
+
+# 获取笔记详情（feed_id 与 xsec_token 来自搜索结果）
+python scripts/cdp_publish.py get-feed-detail \
+  --feed-id 67abc1234def567890123456 \
+  --xsec-token YOUR_XSEC_TOKEN
+```
+
+### 7) 获取内容数据表（content_data）
+
+```bash
+# 获取笔记基础信息表（曝光/观看/封面点击率/点赞/评论/收藏/涨粉/分享/人均观看时长/弹幕）
+python scripts/cdp_publish.py content-data
+
+# 下划线别名
+python scripts/cdp_publish.py content_data
+
+# 可选：导出 CSV
+python scripts/cdp_publish.py --reuse-existing-tab content-data --csv-file "/abs/path/content_data.csv"
 ```
 
 ## 失败处理

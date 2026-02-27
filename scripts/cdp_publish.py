@@ -6,18 +6,21 @@ publishing articles on Xiaohongshu (RED) creator center.
 
 CLI usage:
     # Basic commands
-    python cdp_publish.py [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
+    python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] content-data [--page-num 1] [--page-size 10] [--type 0]
 
     # Account management
-    python cdp_publish.py [--port PORT] login [--account NAME]           # open browser for QR login
-    python cdp_publish.py [--port PORT] re-login [--account NAME]        # clear cookies and re-login same account
-    python cdp_publish.py [--port PORT] switch-account [--account NAME]  # clear cookies + open login for new account
-    python cdp_publish.py [--port PORT] list-accounts                    # list all configured accounts
-    python cdp_publish.py [--port PORT] add-account NAME [--alias ALIAS] # add a new account
-    python cdp_publish.py [--port PORT] remove-account NAME              # remove an account
+    python cdp_publish.py [--host HOST] [--port PORT] login [--account NAME]           # open browser for QR login
+    python cdp_publish.py [--host HOST] [--port PORT] re-login [--account NAME]        # clear cookies and re-login same account
+    python cdp_publish.py [--host HOST] [--port PORT] switch-account [--account NAME]  # clear cookies + open login for new account
+    python cdp_publish.py [--host HOST] [--port PORT] list-accounts                    # list all configured accounts
+    python cdp_publish.py [--host HOST] [--port PORT] add-account NAME [--alias ALIAS] # add a new account
+    python cdp_publish.py [--host HOST] [--port PORT] remove-account NAME              # remove an account
 
 Library usage:
     from cdp_publish import XiaohongshuPublisher
@@ -37,7 +40,18 @@ import os
 import random
 import time
 import sys
+import csv
+import base64
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from urllib.parse import parse_qs, urlparse
 from typing import Any
+
+# Add scripts dir to path so sibling modules can be imported in both
+# "python scripts/cdp_publish.py" and "import scripts.cdp_publish" modes.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -50,6 +64,18 @@ if sys.platform == "win32":
 
 import requests
 import websockets.sync.client as ws_client
+from feed_explorer import (
+    LOCATION_OPTIONS,
+    NOTE_TYPE_OPTIONS,
+    PUBLISH_TIME_OPTIONS,
+    SEARCH_SCOPE_OPTIONS,
+    SORT_BY_OPTIONS,
+    FeedExplorer,
+    FeedExplorerError,
+    SearchFilters,
+    make_feed_detail_url,
+    make_search_url,
+)
 from run_lock import SingleInstanceError, single_instance
 
 # ---------------------------------------------------------------------------
@@ -62,7 +88,10 @@ CDP_PORT = 9222
 # Xiaohongshu URLs
 XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish"
 XHS_HOME_URL = "https://www.xiaohongshu.com"
-XHS_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
+XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
+XHS_HOME_LOGIN_MODAL_KEYWORD = "登录后推荐更懂你的笔记"
+XHS_CONTENT_DATA_URL = "https://creator.xiaohongshu.com/statistics/data-analysis"
+XHS_CONTENT_DATA_API_PATH = "/api/galaxy/creator/datacenter/note/analyze/list"
 
 # DOM selectors (update these when Xiaohongshu changes their page structure)
 # Last verified: 2026-02
@@ -101,6 +130,110 @@ MAX_TIMING_JITTER_RATIO = 0.7
 def _normalize_timing_jitter(value: float) -> float:
     """Clamp timing jitter to a safe range."""
     return max(0.0, min(MAX_TIMING_JITTER_RATIO, value))
+
+
+def _is_local_host(host: str) -> bool:
+    """Return True when host points to the local machine."""
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _build_search_filters_from_args(args) -> SearchFilters | None:
+    """Build search filter object from parsed CLI arguments."""
+    filters = SearchFilters(
+        sort_by=getattr(args, "sort_by", None),
+        note_type=getattr(args, "note_type", None),
+        publish_time=getattr(args, "publish_time", None),
+        search_scope=getattr(args, "search_scope", None),
+        location=getattr(args, "location", None),
+    )
+    return filters if filters.selected_items() else None
+
+
+def _format_post_time(post_time_ms: Any) -> str:
+    """Format note publish time in Asia/Shanghai timezone."""
+    if not isinstance(post_time_ms, (int, float)):
+        return "-"
+    try:
+        dt = datetime.fromtimestamp(post_time_ms / 1000, tz=ZoneInfo("Asia/Shanghai"))
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+def _format_cover_click_rate(value: Any) -> str:
+    """Format cover click rate as percentage text."""
+    if not isinstance(value, (int, float)):
+        return "-"
+    normalized = value * 100 if 0 <= value <= 1 else value
+    return f"{normalized:.2f}%"
+
+
+def _format_view_time_avg(value: Any) -> str:
+    """Format average view duration in seconds."""
+    if not isinstance(value, (int, float)):
+        return "-"
+    return f"{int(value)}s"
+
+
+def _metric_or_dash(note: dict[str, Any], field: str) -> Any:
+    """Return field value if present, otherwise '-'."""
+    value = note.get(field)
+    return "-" if value is None else value
+
+
+def _map_note_infos_to_content_rows(note_infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map note_infos payload to content table rows."""
+    rows: list[dict[str, Any]] = []
+    for note in note_infos:
+        rows.append({
+            "标题": note.get("title") or "-",
+            "发布时间": _format_post_time(note.get("post_time")),
+            "曝光": _metric_or_dash(note, "imp_count"),
+            "观看": _metric_or_dash(note, "read_count"),
+            "封面点击率": _format_cover_click_rate(note.get("coverClickRate")),
+            "点赞": _metric_or_dash(note, "like_count"),
+            "评论": _metric_or_dash(note, "comment_count"),
+            "收藏": _metric_or_dash(note, "fav_count"),
+            "涨粉": _metric_or_dash(note, "increase_fans_count"),
+            "分享": _metric_or_dash(note, "share_count"),
+            "人均观看时长": _format_view_time_avg(note.get("view_time_avg")),
+            "弹幕": _metric_or_dash(note, "danmaku_count"),
+            "操作": "详情数据",
+            "_id": note.get("id") or "",
+        })
+    return rows
+
+
+def _write_content_data_csv(csv_file: str, rows: list[dict[str, Any]]) -> str:
+    """Write content rows to a UTF-8 CSV file and return absolute path."""
+    abs_path = os.path.abspath(csv_file)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    columns = [
+        "标题",
+        "发布时间",
+        "曝光",
+        "观看",
+        "封面点击率",
+        "点赞",
+        "评论",
+        "收藏",
+        "涨粉",
+        "分享",
+        "人均观看时长",
+        "弹幕",
+        "操作",
+        "_id",
+    ]
+    with open(abs_path, "w", encoding="utf-8-sig", newline="") as csv_handle:
+        writer = csv.DictWriter(csv_handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    return abs_path
 
 
 class CDPError(Exception):
@@ -148,9 +281,15 @@ class XiaohongshuPublisher:
                 return resp.json()
             except Exception as e:
                 if attempt == 0:
-                    print(f"[cdp_publish] CDP connection failed ({e}), restarting Chrome...")
-                    from chrome_launcher import ensure_chrome
-                    ensure_chrome(port=self.port)
+                    if _is_local_host(self.host):
+                        print(f"[cdp_publish] CDP connection failed ({e}), restarting Chrome...")
+                        from chrome_launcher import ensure_chrome
+                        ensure_chrome(port=self.port)
+                    else:
+                        print(
+                            f"[cdp_publish] CDP connection failed ({e}), retrying remote endpoint "
+                            f"{self.host}:{self.port}..."
+                        )
                     self._sleep(2, minimum_seconds=1.0)
                 else:
                     raise CDPError(f"Cannot reach Chrome on {self.host}:{self.port}: {e}")
@@ -277,7 +416,7 @@ class XiaohongshuPublisher:
         Returns True if logged in. If not logged in, prints instructions
         and returns False.
         """
-        self._navigate(XHS_LOGIN_CHECK_URL)
+        self._navigate(XHS_CREATOR_LOGIN_CHECK_URL)
         self._sleep(2, minimum_seconds=1.0)
 
         # Check if we got redirected to a login page
@@ -293,6 +432,83 @@ class XiaohongshuPublisher:
             return False
 
         print("[cdp_publish] Login confirmed.")
+        return True
+
+    def _home_login_prompt_visible(self, keyword: str) -> bool:
+        """Return True when home page login prompt modal is visible."""
+        keyword_literal = json.dumps(keyword)
+        visible = self._evaluate(f"""
+            (() => {{
+                const keyword = {keyword_literal};
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const containsKeyword = (text) => normalize(text).includes(keyword);
+
+                const modalSelectors = [
+                    "[class*='login']",
+                    "[class*='modal']",
+                    "[class*='popup']",
+                    "[class*='dialog']",
+                    "[class*='mask']",
+                ];
+
+                for (const selector of modalSelectors) {{
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {{
+                        if (!(node instanceof HTMLElement)) {{
+                            continue;
+                        }}
+                        if (node.offsetParent === null) {{
+                            continue;
+                        }}
+                        if (containsKeyword(node.textContent) || containsKeyword(node.innerText)) {{
+                            return true;
+                        }}
+                    }}
+                }}
+
+                if (document.body && containsKeyword(document.body.innerText)) {{
+                    return true;
+                }}
+                return false;
+            }})()
+        """)
+        return bool(visible)
+
+    def check_home_login(
+        self,
+        keyword: str = XHS_HOME_LOGIN_MODAL_KEYWORD,
+        wait_seconds: float = 8.0,
+    ) -> bool:
+        """
+        Check login state on Xiaohongshu home page.
+
+        Login prompt modal keyword (default: "登录后推荐更懂你的笔记") indicates
+        unauthenticated state for the xiaohongshu.com home/feed domain.
+        """
+        self._navigate(XHS_HOME_URL)
+        self._sleep(2, minimum_seconds=1.0)
+
+        current_url = self._evaluate("window.location.href")
+        print(f"[cdp_publish] Home URL: {current_url}")
+        if isinstance(current_url, str) and "login" in current_url.lower():
+            print(
+                "\n[cdp_publish] NOT LOGGED IN (HOME).\n"
+                "  Please log in on xiaohongshu.com and run this command again.\n"
+            )
+            return False
+
+        deadline = time.time() + max(1.0, wait_seconds)
+        while time.time() < deadline:
+            if self._home_login_prompt_visible(keyword):
+                print(
+                    "\n[cdp_publish] NOT LOGGED IN (HOME).\n"
+                    f"  Detected login prompt keyword: {keyword}\n"
+                    "  Please log in on xiaohongshu.com and run this command again.\n"
+                )
+                return False
+            self._sleep(0.7, minimum_seconds=0.2)
+
+        print("[cdp_publish] Home login confirmed.")
         return True
 
     def clear_cookies(self, domain: str = ".xiaohongshu.com"):
@@ -321,7 +537,7 @@ class XiaohongshuPublisher:
 
         Used for initial login or after clearing cookies for account switch.
         """
-        self._navigate(XHS_LOGIN_CHECK_URL)
+        self._navigate(XHS_CREATOR_LOGIN_CHECK_URL)
         self._sleep(2, minimum_seconds=1.0)
         current_url = self._evaluate("window.location.href")
         if "login" not in current_url.lower():
@@ -332,6 +548,203 @@ class XiaohongshuPublisher:
             "\n[cdp_publish] Login page is open.\n"
             "  Please scan the QR code in the Chrome window to log in.\n"
         )
+
+    # ------------------------------------------------------------------
+    # Feed discovery actions
+    # ------------------------------------------------------------------
+
+    def search_feeds(
+        self,
+        keyword: str,
+        filters: SearchFilters | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Search Xiaohongshu feeds by keyword and optional filters.
+
+        Returns a list of feed objects extracted from `window.__INITIAL_STATE__`.
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        keyword = keyword.strip()
+        if not keyword:
+            raise CDPError("Keyword cannot be empty.")
+
+        search_url = make_search_url(keyword)
+        self._navigate(search_url)
+        self._sleep(2, minimum_seconds=1.0)
+
+        explorer = FeedExplorer(
+            self._evaluate,
+            self._sleep,
+            move_mouse=self._move_mouse,
+            click_mouse=self._click_mouse,
+        )
+        try:
+            feeds = explorer.search_feeds(keyword=keyword, filters=filters)
+        except FeedExplorerError as e:
+            raise CDPError(str(e)) from e
+
+        print(
+            f"[cdp_publish] Search completed. keyword={keyword}, "
+            f"feeds={len(feeds)}"
+        )
+        return feeds
+
+    def get_feed_detail(self, feed_id: str, xsec_token: str) -> dict[str, Any]:
+        """
+        Get feed detail from note page initial state.
+
+        Returns a detail object containing `note` and `comments` (if available).
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(2, minimum_seconds=1.0)
+
+        explorer = FeedExplorer(self._evaluate, self._sleep)
+        try:
+            detail = explorer.get_feed_detail(feed_id=feed_id)
+        except FeedExplorerError as e:
+            raise CDPError(str(e)) from e
+
+        print(f"[cdp_publish] Feed detail loaded. feed_id={feed_id}")
+        return detail
+
+    def get_content_data(
+        self,
+        page_num: int = 1,
+        page_size: int = 10,
+        note_type: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Fetch creator content data table from data-analysis API.
+
+        Args:
+            page_num: Page number (1-based).
+            page_size: Rows per page.
+            note_type: API type filter value (default: 0).
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+        if page_num < 1:
+            raise CDPError("--page-num must be >= 1.")
+        if page_size < 1:
+            raise CDPError("--page-size must be >= 1.")
+        # Important: direct fetch to this API can be rejected (e.g. 406) when
+        # anti-bot headers are not present. We therefore capture the real
+        # browser request generated by page scripts and read response body via CDP.
+        self._send("Page.enable")
+        self._send("Network.enable", {"maxPostDataSize": 65536})
+        self._send("Page.navigate", {"url": XHS_CONTENT_DATA_URL})
+
+        request_url_by_id: dict[str, str] = {}
+        target_request_id = ""
+        target_request_url = ""
+        deadline = time.time() + 18
+
+        while time.time() < deadline:
+            timeout = min(1.0, max(0.1, deadline - time.time()))
+            try:
+                raw = self.ws.recv(timeout=timeout)
+            except TimeoutError:
+                continue
+
+            message = json.loads(raw)
+            method = message.get("method")
+            params = message.get("params", {})
+
+            if method == "Network.requestWillBeSent":
+                request_id = params.get("requestId")
+                request = params.get("request", {})
+                if isinstance(request_id, str):
+                    request_url_by_id[request_id] = request.get("url", "")
+                continue
+
+            if method == "Network.responseReceived":
+                request_id = params.get("requestId")
+                if not isinstance(request_id, str):
+                    continue
+
+                request_url = request_url_by_id.get(request_id, "")
+                if XHS_CONTENT_DATA_API_PATH not in request_url:
+                    continue
+
+                status = params.get("response", {}).get("status")
+                if status != 200:
+                    raise CDPError(
+                        "Content data API responded with non-200 status: "
+                        f"{status}, url={request_url}"
+                    )
+
+                target_request_id = request_id
+                target_request_url = request_url
+                break
+
+        if not target_request_id:
+            raise CDPError(
+                "Timed out waiting for content data request. "
+                "Please open data-analysis page manually and retry."
+            )
+
+        body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
+        body_text = body_result.get("body", "")
+        if body_result.get("base64Encoded"):
+            body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError as e:
+            raise CDPError(
+                "Failed to decode content data API JSON: "
+                f"{e}; preview={body_text[:300]}"
+            ) from e
+
+        if not isinstance(payload, dict):
+            raise CDPError("Unexpected content data payload structure.")
+
+        data = payload.get("data")
+        note_infos = data.get("note_infos") if isinstance(data, dict) else []
+        if not isinstance(note_infos, list):
+            note_infos = []
+        rows = _map_note_infos_to_content_rows(note_infos)
+
+        query = parse_qs(urlparse(target_request_url).query)
+        resolved_page_num = int((query.get("page_num") or ["1"])[0])
+        resolved_page_size = int((query.get("page_size") or ["10"])[0])
+        resolved_type = int((query.get("type") or ["0"])[0])
+
+        if (
+            page_num != resolved_page_num
+            or page_size != resolved_page_size
+            or note_type != resolved_type
+        ):
+            print(
+                "[cdp_publish] Warning: Requested pagination/filter differs from "
+                "captured page request. Returning captured data instead."
+            )
+
+        return {
+            "request_url": target_request_url,
+            "requested_page_num": page_num,
+            "requested_page_size": page_size,
+            "requested_type": note_type,
+            "resolved_page_num": resolved_page_num,
+            "resolved_page_size": resolved_page_size,
+            "resolved_type": resolved_type,
+            "total": data.get("total") if isinstance(data, dict) else None,
+            "count_returned": len(rows),
+            "rows": rows,
+        }
 
     # ------------------------------------------------------------------
     # Publishing actions
@@ -673,7 +1086,27 @@ class XiaohongshuPublisher:
             print("[cdp_publish] Could not find collect button or already collected.")
         
         return collected
-    
+
+    def _move_mouse(self, x: float, y: float):
+        """Move mouse cursor via CDP to support hover-driven UI."""
+        self._send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved",
+            "x": float(x),
+            "y": float(y),
+        })
+
+    def _click_mouse(self, x: float, y: float):
+        """Perform a real left-click via CDP at the given coordinates."""
+        for event_type in ("mousePressed", "mouseReleased"):
+            self._send("Input.dispatchMouseEvent", {
+                "type": event_type,
+                "x": float(x),
+                "y": float(y),
+                "button": "left",
+                "clickCount": 1,
+            })
+            time.sleep(0.05)
+
     def _click_element_by_cdp(self, description: str, js_get_rect: str):
         """Click an element using CDP Input.dispatchMouseEvent for reliable clicks.
 
@@ -875,6 +1308,11 @@ def main():
     from chrome_launcher import ensure_chrome, restart_chrome
 
     parser = argparse.ArgumentParser(description="Xiaohongshu CDP Publisher")
+    parser.add_argument(
+        "--host",
+        default=CDP_HOST,
+        help=f"CDP host (default: {CDP_HOST})",
+    )
     parser.add_argument("--port", type=int, default=CDP_PORT,
                         help=f"CDP remote debugging port (default: {CDP_PORT})")
     parser.add_argument("--headless", action="store_true",
@@ -923,6 +1361,66 @@ def main():
     # click-publish - just click the publish button on current page
     sub.add_parser("click-publish", help="Click publish button on already-filled page")
 
+    # search-feeds - search note feeds by keyword
+    p_search = sub.add_parser(
+        "search-feeds",
+        aliases=["search_feeds"],
+        help="Search Xiaohongshu feeds by keyword",
+    )
+    p_search.add_argument("--keyword", required=True, help="Search keyword")
+    p_search.add_argument("--sort-by", choices=SORT_BY_OPTIONS, help="Sort by option")
+    p_search.add_argument("--note-type", choices=NOTE_TYPE_OPTIONS, help="Note type filter")
+    p_search.add_argument(
+        "--publish-time",
+        choices=PUBLISH_TIME_OPTIONS,
+        help="Publish time filter",
+    )
+    p_search.add_argument(
+        "--search-scope",
+        choices=SEARCH_SCOPE_OPTIONS,
+        help="Search scope filter",
+    )
+    p_search.add_argument("--location", choices=LOCATION_OPTIONS, help="Location filter")
+
+    # get-feed-detail - get note detail by feed id and token
+    p_detail = sub.add_parser(
+        "get-feed-detail",
+        aliases=["get_feed_detail"],
+        help="Get feed detail by feed id and xsec token",
+    )
+    p_detail.add_argument("--feed-id", required=True, help="Feed id")
+    p_detail.add_argument("--xsec-token", required=True, help="xsec token")
+
+    # content-data - fetch creator content data table
+    p_content_data = sub.add_parser(
+        "content-data",
+        aliases=["content_data"],
+        help="Fetch creator content data table from statistics page",
+    )
+    p_content_data.add_argument(
+        "--page-num",
+        type=int,
+        default=1,
+        help="Page number (default: 1)",
+    )
+    p_content_data.add_argument(
+        "--page-size",
+        type=int,
+        default=10,
+        help="Page size (default: 10)",
+    )
+    p_content_data.add_argument(
+        "--type",
+        dest="note_type",
+        type=int,
+        default=0,
+        help="Type filter value used by API (default: 0)",
+    )
+    p_content_data.add_argument(
+        "--csv-file",
+        help="Optional CSV output path",
+    )
+
     # login - open browser for QR code login (always headed)
     sub.add_parser("login", help="Open browser for QR code login (always headed mode)")
 
@@ -952,11 +1450,13 @@ def main():
     p_def.add_argument("name", help="Account name to set as default")
 
     args = parser.parse_args()
+    host = args.host
     port = args.port
     headless = args.headless
     account = args.account
     reuse_existing_tab = args.reuse_existing_tab
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
+    local_mode = _is_local_host(host)
 
     if timing_jitter != args.timing_jitter:
         print(
@@ -1012,15 +1512,21 @@ def main():
     if args.command in ("login", "re-login", "switch-account"):
         headless = False
 
-    if not ensure_chrome(port=port, headless=headless, account=account):
-        print("Failed to start Chrome. Exiting.")
-        sys.exit(1)
+    if local_mode:
+        if not ensure_chrome(port=port, headless=headless, account=account):
+            print("Failed to start Chrome. Exiting.")
+            sys.exit(1)
+    else:
+        print(
+            f"[cdp_publish] Remote CDP mode enabled: {host}:{port}. "
+            "Skipping local Chrome launch/restart."
+        )
 
     print(f"[cdp_publish] Timing jitter ratio: {timing_jitter:.2f}")
     if reuse_existing_tab:
         print("[cdp_publish] Tab selection mode: prefer reusing existing tab.")
 
-    publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
+    publisher = XiaohongshuPublisher(host=host, port=port, timing_jitter=timing_jitter)
     try:
         if args.command == "check-login":
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
@@ -1064,16 +1570,73 @@ def main():
             publisher._click_publish()
             print("PUBLISH_STATUS: PUBLISHED")
 
+        elif args.command in ("search-feeds", "search_feeds"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            filters = _build_search_filters_from_args(args)
+            feeds = publisher.search_feeds(keyword=args.keyword, filters=filters)
+            payload = {
+                "keyword": args.keyword,
+                "count": len(feeds),
+                "feeds": feeds,
+            }
+            print("SEARCH_FEEDS_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("get-feed-detail", "get_feed_detail"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            detail = publisher.get_feed_detail(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+            )
+            payload = {
+                "feed_id": args.feed_id,
+                "xsec_token": args.xsec_token,
+                "detail": detail,
+            }
+            print("GET_FEED_DETAIL_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("content-data", "content_data"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.get_content_data(
+                page_num=args.page_num,
+                page_size=args.page_size,
+                note_type=args.note_type,
+            )
+            print("CONTENT_DATA_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+            if args.csv_file:
+                csv_path = _write_content_data_csv(
+                    csv_file=args.csv_file,
+                    rows=payload.get("rows", []),
+                )
+                print(f"CONTENT_DATA_CSV: {csv_path}")
+
         elif args.command == "login":
             # Ensure headed mode for QR scanning
-            restart_chrome(port=port, headless=False, account=account)
+            if local_mode:
+                restart_chrome(port=port, headless=False, account=account)
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.open_login_page()
             print("LOGIN_READY")
 
         elif args.command == "re-login":
             # Ensure headed mode, clear cookies, re-open login page for same account
-            restart_chrome(port=port, headless=False, account=account)
+            if local_mode:
+                restart_chrome(port=port, headless=False, account=account)
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
             publisher._sleep(1, minimum_seconds=0.5)
@@ -1082,7 +1645,8 @@ def main():
 
         elif args.command == "switch-account":
             # Ensure headed mode, clear cookies, open login page
-            restart_chrome(port=port, headless=False, account=account)
+            if local_mode:
+                restart_chrome(port=port, headless=False, account=account)
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
             publisher._sleep(1, minimum_seconds=0.5)

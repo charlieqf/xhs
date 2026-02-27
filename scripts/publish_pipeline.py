@@ -72,6 +72,11 @@ def _normalize_timing_jitter(value: float) -> float:
     return max(0.0, min(MAX_TIMING_JITTER_RATIO, value))
 
 
+def _is_local_host(host: str) -> bool:
+    """Return True when host points to the local machine."""
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
 def _jitter_ms(base_ms: int, jitter_ratio: float, minimum_ms: int = 0) -> int:
     """Return a randomized delay in milliseconds around the base value."""
     base = max(minimum_ms, int(base_ms))
@@ -355,6 +360,11 @@ def main():
 
     # CDP port
     parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="CDP host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=9222,
@@ -362,11 +372,13 @@ def main():
     )
 
     args = parser.parse_args()
+    host = args.host
     port = args.port
     headless = args.headless
     account = args.account
     reuse_existing_tab = args.reuse_existing_tab
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
+    local_mode = _is_local_host(host)
 
     if timing_jitter != args.timing_jitter:
         print(
@@ -408,29 +420,43 @@ def main():
     account_label = account or "default"
     print(
         f"[pipeline] Step 1: Ensuring Chrome is running "
-        f"({mode_label}, account: {account_label}, port: {port})..."
+        f"({mode_label}, account: {account_label}, host: {host}, port: {port})..."
     )
     print(f"[pipeline] Timing jitter ratio: {timing_jitter:.2f}")
     if reuse_existing_tab:
         print("[pipeline] Tab selection mode: prefer reusing existing tab.")
-    if not ensure_chrome(port=port, headless=headless, account=account):
-        print("Error: Failed to start Chrome.", file=sys.stderr)
-        sys.exit(2)
+    if local_mode:
+        if not ensure_chrome(port=port, headless=headless, account=account):
+            print("Error: Failed to start Chrome.", file=sys.stderr)
+            sys.exit(2)
+    else:
+        print(
+            f"[pipeline] Remote CDP mode enabled: {host}:{port}. "
+            "Skipping local Chrome launch/restart."
+        )
 
     # --- Step 2: Connect and check login ---
     print("[pipeline] Step 2: Checking login status...")
-    publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
+    publisher = XiaohongshuPublisher(host=host, port=port, timing_jitter=timing_jitter)
     try:
         publisher.connect(reuse_existing_tab=reuse_existing_tab)
         logged_in = publisher.check_login()
         if not logged_in:
             publisher.disconnect()
             if headless:
-                # Auto-fallback: restart Chrome in headed mode for QR login
-                print("[pipeline] Headless mode: not logged in. Switching to headed mode for login...")
-                restart_chrome(port=port, headless=False, account=account)
-                publisher.connect(reuse_existing_tab=reuse_existing_tab)
-                publisher.open_login_page()
+                if local_mode:
+                    # Auto-fallback: restart Chrome in headed mode for QR login
+                    print("[pipeline] Headless mode: not logged in. Switching to headed mode for login...")
+                    restart_chrome(port=port, headless=False, account=account)
+                    publisher.connect(reuse_existing_tab=reuse_existing_tab)
+                    publisher.open_login_page()
+                else:
+                    print(
+                        "[pipeline] Headless + remote mode: cannot auto-restart remote Chrome. "
+                        "Attempting to open login page on existing remote browser..."
+                    )
+                    publisher.connect(reuse_existing_tab=reuse_existing_tab)
+                    publisher.open_login_page()
             print("NOT_LOGGED_IN")
             sys.exit(1)
     except CDPError as e:
@@ -520,7 +546,11 @@ def main():
             # Open the note in a new tab
             publisher.disconnect()
             # Create a new publisher instance for the note page
-            note_publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
+            note_publisher = XiaohongshuPublisher(
+                host=host,
+                port=port,
+                timing_jitter=timing_jitter,
+            )
             note_publisher.connect()
             note_publisher._navigate(note_link)
             

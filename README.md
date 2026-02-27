@@ -8,8 +8,11 @@
 - **话题标签自动写入**：识别正文最后一行 `#标签`，然后逐渐写入
 - **多账号支持**：支持管理多个小红书账号，各账号 Cookie 隔离
 - **无头模式**：支持后台运行，无需显示浏览器窗口
+- **远程 CDP 支持**：可通过 `--host` / `--port` 连接远程 Chrome 调试端口
 - **图片下载**：支持从 URL 自动下载图片，自动添加 Referer 绕过防盗链
 - **登录检测**：自动检测登录状态，未登录时自动切换到有窗口模式扫码
+- **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据）
+- **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
 
 ## 安装
 
@@ -50,6 +53,9 @@ python scripts/cdp_publish.py check-login
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
 python scripts/cdp_publish.py check-login --reuse-existing-tab
 
+# 连接远程 CDP（Chrome 在另一台机器）
+python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
+
 # 重启测试浏览器
 python scripts/chrome_launcher.py --restart
 
@@ -74,6 +80,12 @@ python scripts/publish_pipeline.py \
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
 python scripts/publish_pipeline.py --reuse-existing-tab \
+    --title "文章标题" \
+    --content "文章正文" \
+    --image-urls "https://example.com/image.jpg"
+
+# 连接远程 CDP 并发布（远程 Chrome 需已开启调试端口）
+python scripts/publish_pipeline.py --host 10.0.0.12 --port 9222 \
     --title "文章标题" \
     --content "文章正文" \
     --image-urls "https://example.com/image.jpg"
@@ -126,6 +138,32 @@ python scripts/cdp_publish.py set-default-account myaccount
 python scripts/cdp_publish.py switch-account
 ```
 
+### 5. 搜索内容与查看笔记详情
+
+```bash
+# 搜索笔记（可选筛选）
+python scripts/cdp_publish.py search-feeds --keyword "春招"
+python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
+
+# 获取笔记详情（feed_id 与 xsec_token 可从搜索结果中获取）
+python scripts/cdp_publish.py get-feed-detail \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token YOUR_XSEC_TOKEN
+```
+
+### 6. 获取内容数据表（content_data）
+
+```bash
+# 抓取“笔记基础信息”数据表
+python scripts/cdp_publish.py content-data
+
+# 下划线别名
+python scripts/cdp_publish.py content_data
+
+# 导出 CSV
+python scripts/cdp_publish.py content-data --csv-file "/abs/path/content_data.csv"
+```
+
 ## 命令参考
 
 ### 话题标签（publish_pipeline.py）
@@ -149,6 +187,8 @@ python scripts/publish_pipeline.py [选项]
   --content-file FILE    从文件读取正文
   --image-urls URL...    图片 URL 列表
   --images FILE...       本地图片文件列表
+  --host HOST            CDP 主机地址（默认 127.0.0.1）
+  --port PORT            CDP 端口（默认 9222）
   --headless             无头模式（无浏览器窗口）
   --reuse-existing-tab   优先复用已有标签页（默认关闭）
   --account NAME         指定账号
@@ -157,6 +197,7 @@ python scripts/publish_pipeline.py [选项]
 ```
 
 说明：启用 `--reuse-existing-tab` 后，发布流程仍会自动导航到发布页，因此会刷新到目标页面再继续执行。
+说明：当 `--host` 非 `127.0.0.1/localhost` 时为远程模式，会跳过本地 `chrome_launcher.py` 的自动启动/重启逻辑，请确保远程 CDP 地址可达。
 
 ### cdp_publish.py
 
@@ -166,13 +207,26 @@ python scripts/publish_pipeline.py [选项]
 # 检查登录状态
 python scripts/cdp_publish.py check-login
 python scripts/cdp_publish.py check-login --reuse-existing-tab
+python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 check-login
 
 # 填写表单（不发布）
 python scripts/cdp_publish.py fill --title "标题" --content "正文" --images img.jpg
 python scripts/cdp_publish.py fill --title "标题" --content "正文" --images img.jpg --reuse-existing-tab
+python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 fill --title "标题" --content "正文" --images img.jpg
 
 # 点击发布按钮
 python scripts/cdp_publish.py click-publish
+
+# 搜索笔记（支持下划线别名：search_feeds）
+python scripts/cdp_publish.py search-feeds --keyword "春招"
+python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
+
+# 获取笔记详情（支持下划线别名：get_feed_detail）
+python scripts/cdp_publish.py get-feed-detail --feed-id FEED_ID --xsec-token XSEC_TOKEN
+
+# 获取内容数据表（支持下划线别名：content_data）
+python scripts/cdp_publish.py content-data
+python scripts/cdp_publish.py content-data --csv-file "/abs/path/content_data.csv"
 
 # 账号管理
 python scripts/cdp_publish.py login
@@ -182,6 +236,9 @@ python scripts/cdp_publish.py remove-account NAME [--delete-profile]
 python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
+
+说明：`search-feeds` 与 `get-feed-detail` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
+说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
 
 ### chrome_launcher.py
 
