@@ -6,10 +6,10 @@ publishing articles on Xiaohongshu (RED) creator center.
 
 CLI usage:
     # Basic commands
-    python cdp_publish.py [--port PORT] check-login [--headless] [--account NAME]
-    python cdp_publish.py [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME]
-    python cdp_publish.py [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME]
-    python cdp_publish.py [--port PORT] click-publish [--headless] [--account NAME]
+    python cdp_publish.py [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
 
     # Account management
     python cdp_publish.py [--port PORT] login [--account NAME]           # open browser for QR login
@@ -34,6 +34,7 @@ Library usage:
 
 import json
 import os
+import random
 import time
 import sys
 from typing import Any
@@ -94,6 +95,12 @@ UPLOAD_WAIT = 6  # seconds to wait after image upload for editor to appear
 VIDEO_PROCESS_TIMEOUT = 120  # seconds to wait for video processing
 VIDEO_PROCESS_POLL = 3  # seconds between video processing status checks
 ACTION_INTERVAL = 1  # seconds between actions
+MAX_TIMING_JITTER_RATIO = 0.7
+
+
+def _normalize_timing_jitter(value: float) -> float:
+    """Clamp timing jitter to a safe range."""
+    return max(0.0, min(MAX_TIMING_JITTER_RATIO, value))
 
 
 class CDPError(Exception):
@@ -103,11 +110,29 @@ class CDPError(Exception):
 class XiaohongshuPublisher:
     """Automates publishing to Xiaohongshu via CDP."""
 
-    def __init__(self, host: str = CDP_HOST, port: int = CDP_PORT):
+    def __init__(
+        self,
+        host: str = CDP_HOST,
+        port: int = CDP_PORT,
+        timing_jitter: float = 0.25,
+    ):
         self.host = host
         self.port = port
         self.ws = None
         self._msg_id = 0
+        self.timing_jitter = _normalize_timing_jitter(timing_jitter)
+
+    def _sleep(self, base_seconds: float, minimum_seconds: float = 0.05):
+        """Sleep with optional randomized jitter to avoid rigid timing patterns."""
+        base = max(minimum_seconds, float(base_seconds))
+        if self.timing_jitter <= 0:
+            time.sleep(base)
+            return
+
+        delta = base * self.timing_jitter
+        low = max(minimum_seconds, base - delta)
+        high = max(low, base + delta)
+        time.sleep(random.uniform(low, high))
 
     # ------------------------------------------------------------------
     # CDP connection management
@@ -126,19 +151,40 @@ class XiaohongshuPublisher:
                     print(f"[cdp_publish] CDP connection failed ({e}), restarting Chrome...")
                     from chrome_launcher import ensure_chrome
                     ensure_chrome(port=self.port)
-                    time.sleep(2)
+                    self._sleep(2, minimum_seconds=1.0)
                 else:
                     raise CDPError(f"Cannot reach Chrome on {self.host}:{self.port}: {e}")
 
-    def _find_or_create_tab(self, target_url_prefix: str = "") -> str:
-        """Find an existing tab matching the URL prefix, or return the first page tab."""
+    def _find_or_create_tab(
+        self,
+        target_url_prefix: str = "",
+        reuse_existing_tab: bool = False,
+    ) -> str:
+        """
+        Find a tab to connect.
+
+        Default behavior is backward-compatible: create a new tab first.
+        When `reuse_existing_tab` is enabled, prefer reusing an existing page tab
+        to reduce focus switching in headed mode.
+        """
         targets = self._get_targets()
-        pages = [t for t in targets if t.get("type") == "page"]
+        pages = [
+            t for t in targets
+            if t.get("type") == "page" and t.get("webSocketDebuggerUrl")
+        ]
 
         if target_url_prefix:
             for t in pages:
                 if t.get("url", "").startswith(target_url_prefix):
                     return t["webSocketDebuggerUrl"]
+
+        if reuse_existing_tab and pages:
+            url = pages[0].get("url", "")
+            print(
+                "[cdp_publish] Reusing existing tab to reduce focus switching: "
+                f"{url}"
+            )
+            return pages[0]["webSocketDebuggerUrl"]
 
         # Create a new tab
         resp = requests.put(
@@ -146,7 +192,9 @@ class XiaohongshuPublisher:
             timeout=5,
         )
         if resp.ok:
-            return resp.json().get("webSocketDebuggerUrl", "")
+            ws_url = resp.json().get("webSocketDebuggerUrl", "")
+            if ws_url:
+                return ws_url
 
         # Fallback: use first available page
         if pages:
@@ -154,9 +202,12 @@ class XiaohongshuPublisher:
 
         raise CDPError("No browser tabs available.")
 
-    def connect(self, target_url_prefix: str = ""):
+    def connect(self, target_url_prefix: str = "", reuse_existing_tab: bool = False):
         """Connect to a Chrome tab via WebSocket."""
-        ws_url = self._find_or_create_tab(target_url_prefix)
+        ws_url = self._find_or_create_tab(
+            target_url_prefix=target_url_prefix,
+            reuse_existing_tab=reuse_existing_tab,
+        )
         if not ws_url:
             raise CDPError("Could not obtain WebSocket URL for any tab.")
 
@@ -213,7 +264,7 @@ class XiaohongshuPublisher:
         print(f"[cdp_publish] Navigating to {url}")
         self._send("Page.enable")
         self._send("Page.navigate", {"url": url})
-        time.sleep(PAGE_LOAD_WAIT)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.0)
 
     # ------------------------------------------------------------------
     # Login check
@@ -227,7 +278,7 @@ class XiaohongshuPublisher:
         and returns False.
         """
         self._navigate(XHS_LOGIN_CHECK_URL)
-        time.sleep(2)
+        self._sleep(2, minimum_seconds=1.0)
 
         # Check if we got redirected to a login page
         current_url = self._evaluate("window.location.href")
@@ -271,12 +322,12 @@ class XiaohongshuPublisher:
         Used for initial login or after clearing cookies for account switch.
         """
         self._navigate(XHS_LOGIN_CHECK_URL)
-        time.sleep(2)
+        self._sleep(2, minimum_seconds=1.0)
         current_url = self._evaluate("window.location.href")
         if "login" not in current_url.lower():
             # Already logged in, navigate to login page explicitly
             self._navigate("https://creator.xiaohongshu.com/login")
-            time.sleep(2)
+            self._sleep(2, minimum_seconds=1.0)
         print(
             "\n[cdp_publish] Login page is open.\n"
             "  Please scan the QR code in the Chrome window to log in.\n"
@@ -287,15 +338,50 @@ class XiaohongshuPublisher:
     # ------------------------------------------------------------------
 
     def _click_tab(self, tab_selector: str, tab_text: str):
-        """Click a tab by selector and text content."""
+        """Click a publish-mode tab by selector and text content."""
         print(f"[cdp_publish] Clicking '{tab_text}' tab...")
+        selector_alt = (
+            "div.creator-tab, .creator-tab, [class*='creator-tab'], [role='tab'], button, div"
+        )
+        selector_alt_literal = json.dumps(selector_alt)
+        tab_text_literal = json.dumps(tab_text)
 
         clicked = self._evaluate(f"""
             (function() {{
+                var targetText = {tab_text_literal};
+                var fuzzyKeywords = [targetText];
+                if (targetText.indexOf('图文') !== -1) {{
+                    fuzzyKeywords.push('图文', '上传图文');
+                }}
+                if (targetText.indexOf('视频') !== -1) {{
+                    fuzzyKeywords.push('视频', '上传视频');
+                }}
+
+                function matches(text) {{
+                    var t = (text || '').trim();
+                    if (!t) return false;
+                    if (t === targetText) return true;
+                    for (var i = 0; i < fuzzyKeywords.length; i++) {{
+                        var keyword = fuzzyKeywords[i];
+                        if (keyword && t.indexOf(keyword) !== -1) {{
+                            return true;
+                        }}
+                    }}
+                    return false;
+                }}
+
                 var tabs = document.querySelectorAll('{tab_selector}');
                 for (var i = 0; i < tabs.length; i++) {{
-                    if (tabs[i].textContent.trim() === '{tab_text}') {{
+                    if (matches(tabs[i].textContent)) {{
                         tabs[i].click();
+                        return true;
+                    }}
+                }}
+
+                var allTabs = document.querySelectorAll({selector_alt_literal});
+                for (var j = 0; j < allTabs.length; j++) {{
+                    if (matches(allTabs[j].textContent)) {{
+                        allTabs[j].click();
                         return true;
                     }}
                 }}
@@ -304,13 +390,25 @@ class XiaohongshuPublisher:
         """)
 
         if not clicked:
+            if "图文" in tab_text:
+                upload_ready = self._evaluate(
+                    f"!!document.querySelector('{SELECTORS['upload_input']}') || "
+                    f"!!document.querySelector('{SELECTORS['upload_input_alt']}')"
+                )
+                if upload_ready:
+                    print(
+                        "[cdp_publish] '上传图文' tab not found, but upload input is ready. "
+                        "Continuing..."
+                    )
+                    return
+
             raise CDPError(
                 f"Could not find '{tab_text}' tab. "
                 "The page structure may have changed."
             )
 
         print(f"[cdp_publish] Tab '{tab_text}' clicked, waiting for upload area...")
-        time.sleep(TAB_CLICK_WAIT)
+        self._sleep(TAB_CLICK_WAIT, minimum_seconds=0.8)
 
     def _click_image_text_tab(self):
         """Click the '上传图文' tab to switch to image+text publish mode."""
@@ -362,7 +460,7 @@ class XiaohongshuPublisher:
         })
 
         print("[cdp_publish] Images uploaded. Waiting for editor to appear...")
-        time.sleep(UPLOAD_WAIT)
+        self._sleep(UPLOAD_WAIT, minimum_seconds=2.0)
 
     def _upload_video(self, video_path: str):
         """Upload a video file via the file input element."""
@@ -450,7 +548,7 @@ class XiaohongshuPublisher:
     def _fill_title(self, title: str):
         """Fill in the article title."""
         print(f"[cdp_publish] Setting title: {title[:40]}...")
-        time.sleep(ACTION_INTERVAL)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
         for selector in (SELECTORS["title_input"], SELECTORS["title_input_alt"]):
             found = self._evaluate(f"!!document.querySelector('{selector}')")
@@ -476,7 +574,7 @@ class XiaohongshuPublisher:
     def _fill_content(self, content: str):
         """Fill in the article body content using the TipTap/ProseMirror editor."""
         print(f"[cdp_publish] Setting content ({len(content)} chars)...")
-        time.sleep(ACTION_INTERVAL)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
         for selector in (SELECTORS["content_editor"], SELECTORS["content_editor_alt"]):
             found = self._evaluate(f"!!document.querySelector('{selector}')")
@@ -507,7 +605,7 @@ class XiaohongshuPublisher:
     def _like_note(self):
         """Like the current note."""
         print("[cdp_publish] Liking note...")
-        time.sleep(ACTION_INTERVAL)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
         
         liked = self._evaluate("""
             (function() {{
@@ -543,7 +641,7 @@ class XiaohongshuPublisher:
     def _collect_note(self):
         """Collect the current note."""
         print("[cdp_publish] Collecting note...")
-        time.sleep(ACTION_INTERVAL)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
         
         collected = self._evaluate("""
             (function() {{
@@ -613,7 +711,7 @@ class XiaohongshuPublisher:
     def _click_publish(self):
         """Click the publish button using CDP mouse events."""
         print("[cdp_publish] Clicking publish button...")
-        time.sleep(ACTION_INTERVAL)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
         btn_text = SELECTORS["publish_button_text"]
 
@@ -651,7 +749,7 @@ class XiaohongshuPublisher:
         print("[cdp_publish] Publish button clicked.")
 
         # Wait for publish success and get note link
-        time.sleep(5)  # Wait for publish success page
+        self._sleep(5, minimum_seconds=2.0)
         note_link = self._evaluate("""
             (function() {
                 // Try to find note link in success message
@@ -701,7 +799,7 @@ class XiaohongshuPublisher:
 
         # Step 1: Navigate to publish page
         self._navigate(XHS_CREATOR_URL)
-        time.sleep(2)
+        self._sleep(2, minimum_seconds=1.0)
 
         # Step 2: Click '上传图文' tab
         self._click_image_text_tab()
@@ -782,6 +880,23 @@ def main():
     parser.add_argument("--headless", action="store_true",
                         help="Use headless Chrome (no GUI window)")
     parser.add_argument("--account", help="Account name to use (default: default account)")
+    parser.add_argument(
+        "--timing-jitter",
+        type=float,
+        default=0.25,
+        help=(
+            "Timing jitter ratio for operation delays (default: 0.25). "
+            "Set 0 to disable random jitter."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-existing-tab",
+        action="store_true",
+        help=(
+            "Prefer reusing an existing tab before creating a new one. "
+            "Useful in headed mode to reduce foreground focus switching."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # check-login
@@ -840,6 +955,14 @@ def main():
     port = args.port
     headless = args.headless
     account = args.account
+    reuse_existing_tab = args.reuse_existing_tab
+    timing_jitter = _normalize_timing_jitter(args.timing_jitter)
+
+    if timing_jitter != args.timing_jitter:
+        print(
+            "[cdp_publish] Warning: --timing-jitter out of range. "
+            f"Clamped to {timing_jitter:.2f}."
+        )
 
     # Account management commands that don't need Chrome
     if args.command == "list-accounts":
@@ -893,10 +1016,14 @@ def main():
         print("Failed to start Chrome. Exiting.")
         sys.exit(1)
 
-    publisher = XiaohongshuPublisher(port=port)
+    print(f"[cdp_publish] Timing jitter ratio: {timing_jitter:.2f}")
+    if reuse_existing_tab:
+        print("[cdp_publish] Tab selection mode: prefer reusing existing tab.")
+
+    publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
     try:
         if args.command == "check-login":
-            publisher.connect()
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
             logged_in = publisher.check_login()
             if not logged_in and headless:
                 print(
@@ -914,7 +1041,7 @@ def main():
                 print("Error: --content or --content-file required.", file=sys.stderr)
                 sys.exit(1)
 
-            publisher.connect()
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
             if getattr(args, "video", None):
                 publisher.publish_video(
                     title=args.title, content=content, video_path=args.video
@@ -930,32 +1057,35 @@ def main():
                 print("PUBLISH_STATUS: PUBLISHED")
 
         elif args.command == "click-publish":
-            publisher.connect(target_url_prefix="https://creator.xiaohongshu.com/publish")
+            publisher.connect(
+                target_url_prefix="https://creator.xiaohongshu.com/publish",
+                reuse_existing_tab=reuse_existing_tab,
+            )
             publisher._click_publish()
             print("PUBLISH_STATUS: PUBLISHED")
 
         elif args.command == "login":
             # Ensure headed mode for QR scanning
             restart_chrome(port=port, headless=False, account=account)
-            publisher.connect()
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.open_login_page()
             print("LOGIN_READY")
 
         elif args.command == "re-login":
             # Ensure headed mode, clear cookies, re-open login page for same account
             restart_chrome(port=port, headless=False, account=account)
-            publisher.connect()
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
-            time.sleep(1)
+            publisher._sleep(1, minimum_seconds=0.5)
             publisher.open_login_page()
             print("RE_LOGIN_READY")
 
         elif args.command == "switch-account":
             # Ensure headed mode, clear cookies, open login page
             restart_chrome(port=port, headless=False, account=account)
-            publisher.connect()
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
-            time.sleep(1)
+            publisher._sleep(1, minimum_seconds=0.5)
             publisher.open_login_page()
             print("SWITCH_ACCOUNT_READY")
 

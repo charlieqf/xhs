@@ -74,8 +74,14 @@ python scripts/chrome_launcher.py --headless --port 9223
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
 
+# 可选：优先复用已有标签页（减少有窗口模式下切到前台）
+python scripts/cdp_publish.py check-login --reuse-existing-tab
+
 # 指定端口检查登录
 python scripts/cdp_publish.py --port 9223 check-login
+
+# 指定端口 + 优先复用已有标签页
+python scripts/cdp_publish.py --port 9223 check-login --reuse-existing-tab
 
 # 重启测试浏览器
 python scripts/chrome_launcher.py --restart
@@ -111,6 +117,11 @@ python scripts/publish_pipeline.py --headless \
 
 ```bash
 python scripts/publish_pipeline.py --port 9223 --title-file title.txt \
+  --content-file content.txt \
+  --image-urls "URL1" "URL2"
+
+# 可选：优先复用已有标签页（减少有窗口模式下切到前台）
+python scripts/publish_pipeline.py --port 9223 --reuse-existing-tab --title-file title.txt \
   --content-file content.txt \
   --image-urls "URL1" "URL2"
 ```

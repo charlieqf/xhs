@@ -47,6 +47,9 @@ python scripts/chrome_launcher.py --headless
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
 
+# 可选：优先复用已有标签页（减少有窗口模式下切到前台）
+python scripts/cdp_publish.py check-login --reuse-existing-tab
+
 # 重启测试浏览器
 python scripts/chrome_launcher.py --restart
 
@@ -65,6 +68,12 @@ python scripts/publish_pipeline.py --headless \
 
 # 有窗口模式（可预览）
 python scripts/publish_pipeline.py \
+    --title "文章标题" \
+    --content "文章正文" \
+    --image-urls "https://example.com/image.jpg"
+
+# 可选：优先复用已有标签页（减少有窗口模式下切到前台）
+python scripts/publish_pipeline.py --reuse-existing-tab \
     --title "文章标题" \
     --content "文章正文" \
     --image-urls "https://example.com/image.jpg"
@@ -141,10 +150,13 @@ python scripts/publish_pipeline.py [选项]
   --image-urls URL...    图片 URL 列表
   --images FILE...       本地图片文件列表
   --headless             无头模式（无浏览器窗口）
+  --reuse-existing-tab   优先复用已有标签页（默认关闭）
   --account NAME         指定账号
   --auto-publish         自动点击发布（跳过确认）
   --auto-like-collect    发布后自动点赞和收藏笔记
 ```
+
+说明：启用 `--reuse-existing-tab` 后，发布流程仍会自动导航到发布页，因此会刷新到目标页面再继续执行。
 
 ### cdp_publish.py
 
@@ -153,9 +165,11 @@ python scripts/publish_pipeline.py [选项]
 ```bash
 # 检查登录状态
 python scripts/cdp_publish.py check-login
+python scripts/cdp_publish.py check-login --reuse-existing-tab
 
 # 填写表单（不发布）
 python scripts/cdp_publish.py fill --title "标题" --content "正文" --images img.jpg
+python scripts/cdp_publish.py fill --title "标题" --content "正文" --images img.jpg --reuse-existing-tab
 
 # 点击发布按钮
 python scripts/cdp_publish.py click-publish

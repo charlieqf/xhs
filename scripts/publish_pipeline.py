@@ -18,6 +18,9 @@ Usage:
     # Fill and auto-publish in one step
     python publish_pipeline.py --title "标题" --content "正文" --image-urls URL1 --auto-publish
 
+    # Prefer reusing existing tab (reduce focus switching in headed mode)
+    python publish_pipeline.py --reuse-existing-tab --title "标题" --content "正文" --image-urls URL1
+
     # Use local image files instead of URLs
     python publish_pipeline.py --title "标题" --content "正文" --images img1.jpg img2.jpg
 
@@ -36,6 +39,7 @@ Exit codes:
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -58,6 +62,42 @@ from chrome_launcher import ensure_chrome, restart_chrome
 from cdp_publish import XiaohongshuPublisher, CDPError
 from image_downloader import ImageDownloader
 from run_lock import SingleInstanceError, single_instance
+
+
+MAX_TIMING_JITTER_RATIO = 0.7
+
+
+def _normalize_timing_jitter(value: float) -> float:
+    """Clamp timing jitter to a safe range."""
+    return max(0.0, min(MAX_TIMING_JITTER_RATIO, value))
+
+
+def _jitter_ms(base_ms: int, jitter_ratio: float, minimum_ms: int = 0) -> int:
+    """Return a randomized delay in milliseconds around the base value."""
+    base = max(minimum_ms, int(base_ms))
+    if jitter_ratio <= 0:
+        return base
+
+    delta = int(round(base * jitter_ratio))
+    low = max(minimum_ms, base - delta)
+    high = max(low, base + delta)
+    return random.randint(low, high)
+
+
+def _jitter_seconds(
+    base_seconds: float,
+    jitter_ratio: float,
+    minimum_seconds: float = 0.05,
+) -> float:
+    """Return a randomized delay in seconds around the base value."""
+    base = max(minimum_seconds, float(base_seconds))
+    if jitter_ratio <= 0:
+        return base
+
+    delta = base * jitter_ratio
+    low = max(minimum_seconds, base - delta)
+    high = max(low, base + delta)
+    return random.uniform(low, high)
 
 
 def _extract_topic_tags_from_last_line(content: str) -> tuple[str, list[str]]:
@@ -89,7 +129,11 @@ def _extract_topic_tags_from_last_line(content: str) -> tuple[str, list[str]]:
     return body, parts
 
 
-def _select_topics(publisher: XiaohongshuPublisher, tags: list[str]):
+def _select_topics(
+    publisher: XiaohongshuPublisher,
+    tags: list[str],
+    timing_jitter: float = 0.25,
+):
     """Type each tag, wait for suggestions, then confirm with Enter."""
     if not tags:
         return
@@ -101,6 +145,12 @@ def _select_topics(publisher: XiaohongshuPublisher, tags: list[str]):
         normalized_tag = tag.lstrip("#").strip()
         if not normalized_tag:
             continue
+
+        hash_pause_ms = _jitter_ms(180, timing_jitter, minimum_ms=90)
+        char_delay_min_ms = _jitter_ms(45, timing_jitter, minimum_ms=25)
+        char_delay_max_ms = _jitter_ms(95, timing_jitter, minimum_ms=char_delay_min_ms)
+        suggest_wait_ms = _jitter_ms(3000, timing_jitter, minimum_ms=1600)
+        after_enter_ms = _jitter_ms(260, timing_jitter, minimum_ms=120)
 
         escaped_tag = json.dumps(normalized_tag)
         newline_literal = json.dumps("\n")
@@ -172,17 +222,20 @@ def _select_topics(publisher: XiaohongshuPublisher, tags: list[str]):
                     insertTextAtCaret({newline_literal});
                 }}
                 insertTextAtCaret({hash_literal});
-                await sleep(180);
+                await sleep({hash_pause_ms});
 
                 var tagText = {escaped_tag};
+                var charDelayMin = {char_delay_min_ms};
+                var charDelayMax = {char_delay_max_ms};
                 for (var i = 0; i < tagText.length; i++) {{
                     insertTextAtCaret(tagText[i]);
-                    await sleep(60);
+                    var charDelay = Math.floor(Math.random() * (charDelayMax - charDelayMin + 1)) + charDelayMin;
+                    await sleep(charDelay);
                 }}
 
-                await sleep(3000);
+                await sleep({suggest_wait_ms});
                 pressEnter(editor);
-                await sleep(260);
+                await sleep({after_enter_ms});
                 insertTextAtCaret({space_literal});
                 return {{ ok: true, selected: true }};
             }})()
@@ -194,6 +247,9 @@ def _select_topics(publisher: XiaohongshuPublisher, tags: list[str]):
             print(f"[pipeline] Warning: Failed to select topic {tag} ({reason}).")
         else:
             print(f"[pipeline] Topic selected: {tag}")
+
+        if index < len(tags) - 1:
+            time.sleep(_jitter_seconds(0.45, timing_jitter, minimum_seconds=0.2))
 
     if failed_tags:
         print(
@@ -263,6 +319,26 @@ def main():
         help="Run Chrome in headless mode (no GUI). Auto-falls back to headed if login is needed.",
     )
 
+    parser.add_argument(
+        "--timing-jitter",
+        type=float,
+        default=0.25,
+        help=(
+            "Timing jitter ratio for operation delays (default: 0.25). "
+            "Set 0 to disable random jitter."
+        ),
+    )
+
+    parser.add_argument(
+        "--reuse-existing-tab",
+        action="store_true",
+        default=False,
+        help=(
+            "Prefer reusing an existing Chrome tab before creating a new one. "
+            "Useful in headed mode to reduce foreground focus switching."
+        ),
+    )
+
     # Optional temp dir for downloaded images
     parser.add_argument(
         "--temp-dir",
@@ -289,6 +365,14 @@ def main():
     port = args.port
     headless = args.headless
     account = args.account
+    reuse_existing_tab = args.reuse_existing_tab
+    timing_jitter = _normalize_timing_jitter(args.timing_jitter)
+
+    if timing_jitter != args.timing_jitter:
+        print(
+            "[pipeline] Warning: --timing-jitter out of range. "
+            f"Clamped to {timing_jitter:.2f}."
+        )
 
     # --- Resolve title ---
     if args.title_file:
@@ -326,15 +410,18 @@ def main():
         f"[pipeline] Step 1: Ensuring Chrome is running "
         f"({mode_label}, account: {account_label}, port: {port})..."
     )
+    print(f"[pipeline] Timing jitter ratio: {timing_jitter:.2f}")
+    if reuse_existing_tab:
+        print("[pipeline] Tab selection mode: prefer reusing existing tab.")
     if not ensure_chrome(port=port, headless=headless, account=account):
         print("Error: Failed to start Chrome.", file=sys.stderr)
         sys.exit(2)
 
     # --- Step 2: Connect and check login ---
     print("[pipeline] Step 2: Checking login status...")
-    publisher = XiaohongshuPublisher(port=port)
+    publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
     try:
-        publisher.connect()
+        publisher.connect(reuse_existing_tab=reuse_existing_tab)
         logged_in = publisher.check_login()
         if not logged_in:
             publisher.disconnect()
@@ -342,7 +429,7 @@ def main():
                 # Auto-fallback: restart Chrome in headed mode for QR login
                 print("[pipeline] Headless mode: not logged in. Switching to headed mode for login...")
                 restart_chrome(port=port, headless=False, account=account)
-                publisher.connect()
+                publisher.connect(reuse_existing_tab=reuse_existing_tab)
                 publisher.open_login_page()
             print("NOT_LOGGED_IN")
             sys.exit(1)
@@ -399,7 +486,7 @@ def main():
             publisher.publish(
                 title=title, content=content, image_paths=image_paths
             )
-        _select_topics(publisher, topic_tags)
+        _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
         print("FILL_STATUS: READY_TO_PUBLISH")
     except CDPError as e:
         print(f"Error during form fill: {e}", file=sys.stderr)
@@ -433,12 +520,12 @@ def main():
             # Open the note in a new tab
             publisher.disconnect()
             # Create a new publisher instance for the note page
-            note_publisher = XiaohongshuPublisher(port=port)
+            note_publisher = XiaohongshuPublisher(port=port, timing_jitter=timing_jitter)
             note_publisher.connect()
             note_publisher._navigate(note_link)
             
             # Wait for page to load
-            time.sleep(3)
+            time.sleep(_jitter_seconds(3, timing_jitter, minimum_seconds=1.5))
             
             # Perform like and collect
             note_publisher._like_note()
