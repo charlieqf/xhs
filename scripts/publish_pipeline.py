@@ -308,14 +308,6 @@ def main():
         help="Preview mode: fill content only and never click publish button",
     )
 
-    # Auto like and collect
-    parser.add_argument(
-        "--auto-like-collect",
-        action="store_true",
-        default=False,
-        help="Automatically like and collect the note after publishing",
-    )
-
     # Headless mode
     parser.add_argument(
         "--headless",
@@ -521,7 +513,6 @@ def main():
         sys.exit(2)
 
     # --- Step 5: Publish (optional) ---
-    note_link = None
     should_publish = args.auto_publish and not args.preview
     if args.preview and args.auto_publish:
         print("[pipeline] Preview mode is on, skipping publish click.")
@@ -538,34 +529,6 @@ def main():
             if downloader:
                 downloader.cleanup()
             sys.exit(2)
-
-    # --- Step 6: Auto like and collect (optional) ---
-    if args.auto_like_collect and note_link:
-        print("[pipeline] Step 6: Opening note and performing like/collect...")
-        try:
-            # Open the note in a new tab
-            publisher.disconnect()
-            # Create a new publisher instance for the note page
-            note_publisher = XiaohongshuPublisher(
-                host=host,
-                port=port,
-                timing_jitter=timing_jitter,
-            )
-            note_publisher.connect()
-            note_publisher._navigate(note_link)
-            
-            # Wait for page to load
-            time.sleep(_jitter_seconds(3, timing_jitter, minimum_seconds=1.5))
-            
-            # Perform like and collect
-            note_publisher._like_note()
-            note_publisher._collect_note()
-            
-            print("[pipeline] Like and collect completed.")
-            note_publisher.disconnect()
-        except Exception as e:
-            print(f"Error during like/collect: {e}", file=sys.stderr)
-            # Continue cleanup even if like/collect fails
 
     # --- Cleanup ---
     publisher.disconnect()

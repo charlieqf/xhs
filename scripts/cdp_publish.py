@@ -12,6 +12,8 @@ CLI usage:
     python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
     python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
     python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] post-comment-to-feed --feed-id FEED_ID --xsec-token TOKEN --content "评论内容"
+    python cdp_publish.py [--host HOST] [--port PORT] get-notification-mentions [--wait-seconds 18]
     python cdp_publish.py [--host HOST] [--port PORT] content-data [--page-num 1] [--page-size 10] [--type 0]
 
     # Account management
@@ -88,10 +90,24 @@ CDP_PORT = 9222
 # Xiaohongshu URLs
 XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish"
 XHS_HOME_URL = "https://www.xiaohongshu.com"
+XHS_NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
 XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
 XHS_HOME_LOGIN_MODAL_KEYWORD = "登录后推荐更懂你的笔记"
 XHS_CONTENT_DATA_URL = "https://creator.xiaohongshu.com/statistics/data-analysis"
 XHS_CONTENT_DATA_API_PATH = "/api/galaxy/creator/datacenter/note/analyze/list"
+XHS_NOTIFICATION_MENTIONS_API_PATH = "/api/sns/web/v1/you/mentions"
+XHS_FEED_INACCESSIBLE_KEYWORDS = (
+    "当前笔记暂时无法浏览",
+    "该内容因违规已被删除",
+    "该笔记已被删除",
+    "内容不存在",
+    "笔记不存在",
+    "已失效",
+    "私密笔记",
+    "仅作者可见",
+    "因用户设置，你无法查看",
+    "因违规无法查看",
+)
 
 # DOM selectors (update these when Xiaohongshu changes their page structure)
 # Last verified: 2026-02
@@ -620,6 +636,513 @@ class XiaohongshuPublisher:
         print(f"[cdp_publish] Feed detail loaded. feed_id={feed_id}")
         return detail
 
+    def _check_feed_page_accessible(self):
+        """
+        Check whether the currently opened feed detail page is accessible.
+
+        Raises:
+            CDPError: If page is inaccessible due to privacy/deletion/violation.
+        """
+        keyword_list_literal = json.dumps(
+            list(XHS_FEED_INACCESSIBLE_KEYWORDS),
+            ensure_ascii=False,
+        )
+        issue = self._evaluate(f"""
+            (() => {{
+                const wrappers = document.querySelectorAll(
+                    ".access-wrapper, .error-wrapper, .not-found-wrapper, .blocked-wrapper"
+                );
+                if (!wrappers.length) {{
+                    return "";
+                }}
+
+                let text = "";
+                for (const el of wrappers) {{
+                    const chunk = (el.innerText || el.textContent || "").trim();
+                    if (chunk) {{
+                        text += (text ? " " : "") + chunk;
+                    }}
+                }}
+                const fullText = text.trim();
+                if (!fullText) {{
+                    return "";
+                }}
+
+                const keywords = {keyword_list_literal};
+                for (const kw of keywords) {{
+                    if (fullText.includes(kw)) {{
+                        return kw;
+                    }}
+                }}
+                return fullText.slice(0, 180);
+            }})()
+        """)
+        if isinstance(issue, str) and issue.strip():
+            raise CDPError(f"Feed page is not accessible: {issue.strip()}")
+
+    def _fill_comment_content(self, content: str) -> int:
+        """
+        Fill comment content into feed detail page input.
+
+        Returns:
+            Filled character length.
+        """
+        content_literal = json.dumps(content, ensure_ascii=False)
+        result = self._evaluate(f"""
+            (() => {{
+                const commentText = {content_literal};
+                const candidates = [
+                    "div.input-box div.content-edit p.content-input",
+                    "div.input-box div.content-edit [contenteditable='true']",
+                    "div.input-box .content-input",
+                    "p.content-input",
+                    "[class*='content-edit'] [contenteditable='true']",
+                ];
+
+                let inputEl = null;
+                for (const selector of candidates) {{
+                    const node = document.querySelector(selector);
+                    if (!(node instanceof HTMLElement)) {{
+                        continue;
+                    }}
+                    if (node.offsetParent === null) {{
+                        continue;
+                    }}
+                    inputEl = node;
+                    break;
+                }}
+
+                if (!inputEl) {{
+                    return {{ ok: false, reason: "comment_input_not_found" }};
+                }}
+
+                inputEl.focus();
+
+                if (inputEl instanceof HTMLInputElement || inputEl instanceof HTMLTextAreaElement) {{
+                    inputEl.value = commentText;
+                    inputEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                    inputEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                    return {{
+                        ok: true,
+                        length: inputEl.value.trim().length,
+                    }};
+                }}
+
+                const asEditable = inputEl;
+                if (!asEditable.isContentEditable && asEditable.tagName.toLowerCase() !== "p") {{
+                    const nested = asEditable.querySelector("[contenteditable='true'], p.content-input");
+                    if (nested instanceof HTMLElement) {{
+                        nested.focus();
+                        inputEl = nested;
+                    }}
+                }}
+
+                if (inputEl.tagName.toLowerCase() === "p") {{
+                    inputEl.textContent = commentText;
+                }} else {{
+                    const lines = commentText.split("\\n");
+                    const escapeHtml = (text) => text
+                        .replaceAll("&", "&amp;")
+                        .replaceAll("<", "&lt;")
+                        .replaceAll(">", "&gt;");
+                    const html = lines.map((line) => {{
+                        if (!line.trim()) {{
+                            return "<p><br></p>";
+                        }}
+                        return "<p>" + escapeHtml(line) + "</p>";
+                    }}).join("");
+                    inputEl.innerHTML = html || "<p><br></p>";
+                }}
+
+                inputEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                inputEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+                const finalText = (
+                    inputEl.innerText ||
+                    inputEl.textContent ||
+                    ""
+                ).trim();
+                return {{
+                    ok: true,
+                    length: finalText.length,
+                }};
+            }})()
+        """)
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = "unknown"
+            if isinstance(result, dict):
+                reason = str(result.get("reason", reason))
+            raise CDPError(f"Failed to fill comment content: {reason}")
+
+        return int(result.get("length", 0))
+
+    def post_comment_to_feed(self, feed_id: str, xsec_token: str, content: str) -> dict[str, Any]:
+        """
+        Post a top-level comment to a feed detail page.
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        content = content.strip()
+
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+        if not content:
+            raise CDPError("content cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(2, minimum_seconds=1.0)
+        self._check_feed_page_accessible()
+
+        input_rect_js = """
+            (function() {
+                const selectors = [
+                    "div.input-box div.content-edit span",
+                    "div.input-box div.content-edit p.content-input",
+                    "div.input-box div.content-edit",
+                    "div.input-box",
+                ];
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!(el instanceof HTMLElement) || el.offsetParent === null) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            })();
+        """
+        try:
+            self._click_element_by_cdp("comment input box", input_rect_js)
+            self._sleep(0.4, minimum_seconds=0.15)
+        except CDPError:
+            print(
+                "[cdp_publish] Warning: Could not click comment input via CDP. "
+                "Falling back to direct focus."
+            )
+
+        filled_len = self._fill_comment_content(content)
+        self._sleep(0.6, minimum_seconds=0.2)
+
+        submit_rect_js = """
+            (function() {
+                const selectors = [
+                    "div.bottom button.submit",
+                    "div.bottom button[class*='submit']",
+                    "button.submit",
+                    "button[class*='submit']",
+                    "button[type='submit']",
+                ];
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
+                        continue;
+                    }
+                    if (el.disabled) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                const fallbackTexts = new Set(["发送", "提交", "评论"]);
+                const buttons = document.querySelectorAll("button");
+                for (const button of buttons) {
+                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
+                        continue;
+                    }
+                    if (button.disabled) {
+                        continue;
+                    }
+                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
+                    if (!fallbackTexts.has(text)) {
+                        continue;
+                    }
+                    const r = button.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp("comment submit button", submit_rect_js)
+        self._sleep(1.0, minimum_seconds=0.4)
+
+        print(f"[cdp_publish] Comment posted. feed_id={feed_id}, length={filled_len}")
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "content_length": filled_len,
+            "success": True,
+        }
+
+    def _schedule_click_notification_mentions_tab(self) -> str:
+        """Schedule a click on mentions tab after evaluate returns."""
+        clicked_text = self._evaluate("""
+            (() => {
+                const keywordSet = new Set([
+                    "评论和@",
+                    "评论和 @",
+                    "评论与@",
+                    "提到我的",
+                    "@我的",
+                    "mentions",
+                ]);
+                const selectors = [
+                    "[role='tab']",
+                    "button",
+                    "a",
+                    "div[class*='tab']",
+                    "div[class*='menu-item']",
+                    "li[class*='tab-item']",
+                    "li[class*='tab']",
+                ];
+                const seen = new Set();
+                const candidates = [];
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!(node instanceof HTMLElement)) {
+                            continue;
+                        }
+                        if (node.offsetParent === null) {
+                            continue;
+                        }
+                        if (seen.has(node)) {
+                            continue;
+                        }
+                        seen.add(node);
+                        candidates.push(node);
+                    }
+                }
+
+                for (const node of candidates) {
+                    const text = (node.innerText || node.textContent || "")
+                        .replace(/\\s+/g, " ")
+                        .trim();
+                    if (!text) {
+                        continue;
+                    }
+                    if (text.length > 24) {
+                        continue;
+                    }
+                    const normalized = text.replace(/\\d+/g, "").replace(/\\s+/g, "");
+                    const exactMatches = [
+                        normalized,
+                        text.replace(/\\d+/g, "").trim(),
+                    ];
+                    if (!exactMatches.some((candidate) => keywordSet.has(candidate))) {
+                        continue;
+                    }
+                    window.setTimeout(() => {
+                        try {
+                            node.click();
+                        } catch (error) {
+                            // ignored
+                        }
+                    }, 80);
+                    return text;
+                }
+                return "";
+            })()
+        """)
+        if isinstance(clicked_text, str):
+            return clicked_text.strip()
+        return ""
+
+    def _fetch_notification_mentions_via_page(self) -> dict[str, Any] | None:
+        """Fetch mentions API directly in page context using logged-in cookies."""
+        result = self._evaluate("""
+            (() => fetch(
+                "https://edith.xiaohongshu.com/api/sns/web/v1/you/mentions?num=20&cursor=",
+                {
+                    method: "GET",
+                    credentials: "include",
+                    headers: {
+                        "Accept": "application/json, text/plain, */*",
+                    },
+                }
+            ).then(async (resp) => {
+                const text = await resp.text();
+                return {
+                    ok: resp.ok,
+                    status: resp.status,
+                    url: resp.url,
+                    body: text,
+                };
+            }).catch((error) => {
+                return {
+                    ok: false,
+                    error: String(error),
+                };
+            }))()
+        """)
+        if not isinstance(result, dict):
+            return None
+        if not result.get("ok"):
+            return None
+        if int(result.get("status", 0)) != 200:
+            return None
+        body = result.get("body")
+        if not isinstance(body, str) or not body.strip():
+            return None
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        data = payload.get("data")
+        items: list[Any] = []
+        if isinstance(data, dict):
+            for key in ("message_list", "items", "mentions", "list"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+
+        return {
+            "request_url": result.get("url") or (
+                "https://edith.xiaohongshu.com/api/sns/web/v1/you/mentions?num=20&cursor="
+            ),
+            "count": len(items),
+            "has_more": data.get("has_more") if isinstance(data, dict) else None,
+            "cursor": data.get("cursor") if isinstance(data, dict) else None,
+            "items": items,
+            "raw_payload": payload,
+            "capture_mode": "page_fetch",
+        }
+
+    def get_notification_mentions(self, wait_seconds: float = 18.0) -> dict[str, Any]:
+        """
+        Capture notification mentions API payload from notification page requests.
+
+        The API is captured from real browser traffic to preserve platform
+        signatures/cookies generated by page scripts.
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+        wait_seconds = max(5.0, float(wait_seconds))
+
+        self._send("Page.enable")
+        self._send("Network.enable", {"maxPostDataSize": 65536})
+        self._send("Network.setCacheDisabled", {"cacheDisabled": True})
+        self._send("Page.navigate", {"url": XHS_NOTIFICATION_URL})
+        self._sleep(1.2, minimum_seconds=0.5)
+
+        direct_payload = self._fetch_notification_mentions_via_page()
+        if direct_payload is not None:
+            return direct_payload
+
+        clicked_tab = self._schedule_click_notification_mentions_tab()
+        if clicked_tab:
+            print(f"[cdp_publish] Notification tab clicked: {clicked_tab}")
+
+        request_meta_by_id: dict[str, dict[str, str]] = {}
+        target_request_id = ""
+        target_request_url = ""
+        deadline = time.time() + wait_seconds
+
+        while time.time() < deadline:
+            timeout = min(1.0, max(0.1, deadline - time.time()))
+            try:
+                raw = self.ws.recv(timeout=timeout)
+            except TimeoutError:
+                continue
+
+            message = json.loads(raw)
+            method = message.get("method")
+            params = message.get("params", {})
+
+            if method == "Network.requestWillBeSent":
+                request_id = params.get("requestId")
+                request = params.get("request", {})
+                if isinstance(request_id, str):
+                    request_meta_by_id[request_id] = {
+                        "url": request.get("url", ""),
+                        "method": str(request.get("method", "")).upper(),
+                    }
+                continue
+
+            if method == "Network.responseReceived":
+                request_id = params.get("requestId")
+                if not isinstance(request_id, str):
+                    continue
+
+                request_meta = request_meta_by_id.get(request_id, {})
+                request_url = request_meta.get("url", "")
+                if XHS_NOTIFICATION_MENTIONS_API_PATH not in request_url:
+                    continue
+
+                if request_meta.get("method") == "OPTIONS":
+                    continue
+
+                status = params.get("response", {}).get("status")
+                if status != 200:
+                    raise CDPError(
+                        "Notification mentions API responded with non-200 status: "
+                        f"{status}, url={request_url}"
+                    )
+
+                target_request_id = request_id
+                target_request_url = request_url
+                break
+
+        if not target_request_id:
+            raise CDPError(
+                "Timed out waiting for notification mentions request. "
+                "Please open notification page manually and retry."
+            )
+
+        body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
+        body_text = body_result.get("body", "")
+        if body_result.get("base64Encoded"):
+            body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError as e:
+            raise CDPError(
+                "Failed to decode notification mentions API JSON: "
+                f"{e}; preview={body_text[:300]}"
+            ) from e
+
+        if not isinstance(payload, dict):
+            raise CDPError("Unexpected notification mentions payload structure.")
+
+        data = payload.get("data")
+        items: list[Any] = []
+        if isinstance(data, dict):
+            for key in ("message_list", "items", "mentions", "list"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    items = value
+                    break
+
+        return {
+            "request_url": target_request_url,
+            "count": len(items),
+            "has_more": data.get("has_more") if isinstance(data, dict) else None,
+            "cursor": data.get("cursor") if isinstance(data, dict) else None,
+            "items": items,
+            "raw_payload": payload,
+            "capture_mode": "network_capture",
+        }
+
     def get_content_data(
         self,
         page_num: int = 1,
@@ -1019,7 +1542,7 @@ class XiaohongshuPublisher:
         """Like the current note."""
         print("[cdp_publish] Liking note...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
-        
+
         liked = self._evaluate("""
             (function() {{
                 // Try various like button selectors
@@ -1029,7 +1552,7 @@ class XiaohongshuPublisher:
                     '[data-testid*="like"], [data-testid*="heart"]',
                     'svg[class*="like"], svg[class*="heart"]'
                 ];
-                
+
                 for (var sel of selectors) {{
                     var elements = document.querySelectorAll(sel);
                     for (var el of elements) {{
@@ -1043,19 +1566,19 @@ class XiaohongshuPublisher:
                 return false;
             }})();
         """)
-        
+
         if liked:
             print("[cdp_publish] Note liked.")
         else:
             print("[cdp_publish] Could not find like button or already liked.")
-        
+
         return liked
-    
+
     def _collect_note(self):
         """Collect the current note."""
         print("[cdp_publish] Collecting note...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
-        
+
         collected = self._evaluate("""
             (function() {{
                 // Try various collect button selectors
@@ -1065,7 +1588,7 @@ class XiaohongshuPublisher:
                     '[data-testid*="collect"], [data-testid*="bookmark"]',
                     'svg[class*="collect"], svg[class*="bookmark"]'
                 ];
-                
+
                 for (var sel of selectors) {{
                     var elements = document.querySelectorAll(sel);
                     for (var el of elements) {{
@@ -1079,12 +1602,12 @@ class XiaohongshuPublisher:
                 return false;
             }})();
         """)
-        
+
         if collected:
             print("[cdp_publish] Note collected.")
         else:
             print("[cdp_publish] Could not find collect button or already collected.")
-        
+
         return collected
 
     def _move_mouse(self, x: float, y: float):
@@ -1391,6 +1914,31 @@ def main():
     p_detail.add_argument("--feed-id", required=True, help="Feed id")
     p_detail.add_argument("--xsec-token", required=True, help="xsec token")
 
+    # post-comment-to-feed - post top-level comment to feed detail
+    p_comment = sub.add_parser(
+        "post-comment-to-feed",
+        aliases=["post_comment_to_feed"],
+        help="Post a top-level comment to feed detail",
+    )
+    p_comment.add_argument("--feed-id", required=True, help="Feed id")
+    p_comment.add_argument("--xsec-token", required=True, help="xsec token")
+    p_comment_content = p_comment.add_mutually_exclusive_group(required=True)
+    p_comment_content.add_argument("--content", help="Comment content")
+    p_comment_content.add_argument("--content-file", help="Read comment content from file")
+
+    # get-notification-mentions - capture notification mentions API response
+    p_mentions = sub.add_parser(
+        "get-notification-mentions",
+        aliases=["get_notification_mentions"],
+        help="Capture notification mentions API payload from /notification page",
+    )
+    p_mentions.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=18.0,
+        help="Max seconds to wait for mentions API request (default: 18)",
+    )
+
     # content-data - fetch creator content data table
     p_content_data = sub.add_parser(
         "content-data",
@@ -1602,6 +2150,38 @@ def main():
                 "detail": detail,
             }
             print("GET_FEED_DETAIL_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("post-comment-to-feed", "post_comment_to_feed"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            comment_content = args.content
+            if args.content_file:
+                with open(args.content_file, encoding="utf-8") as f:
+                    comment_content = f.read().strip()
+            if not comment_content:
+                print("Error: --content or --content-file required.", file=sys.stderr)
+                sys.exit(1)
+
+            payload = publisher.post_comment_to_feed(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                content=comment_content,
+            )
+            print("POST_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("get-notification-mentions", "get_notification_mentions"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.get_notification_mentions(wait_seconds=args.wait_seconds)
+            print("GET_NOTIFICATION_MENTIONS_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("content-data", "content_data"):

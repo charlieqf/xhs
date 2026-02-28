@@ -1,7 +1,7 @@
 # RedBookSkills
 
 自动发布内容到小红书（Xiaohongshu/RED）的命令行工具，也支持仅启动测试浏览器（不发布）。
-通过 Chrome DevTools Protocol (CDP) 实现自动化发布，支持多账号管理、无头模式运行、自动搜索素材、点赞评论等功能。
+通过 Chrome DevTools Protocol (CDP) 实现自动化发布，支持多账号管理、无头模式运行、自动搜索素材与内容数据抓取等功能。
 
 ## 功能特性
 - **自动化发布**：自动填写标题、正文、上传图片
@@ -12,6 +12,8 @@
 - **图片下载**：支持从 URL 自动下载图片，自动添加 Referer 绕过防盗链
 - **登录检测**：自动检测登录状态，未登录时自动切换到有窗口模式扫码
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据）
+- **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
+- **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
 - **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
 
 ## 安装
@@ -106,13 +108,6 @@ python scripts/publish_pipeline.py --headless \
     --content "文章正文" \
     --images "C:\path\to\image.jpg"
 
-# 发布后自动点赞和收藏
-python scripts/publish_pipeline.py --headless \
-    --title "文章标题" \
-    --content "文章正文" \
-    --image-urls "https://example.com/image.jpg" \
-    --auto-publish \
-    --auto-like-collect
 ```
 
 ### 4. 多账号管理
@@ -138,7 +133,7 @@ python scripts/cdp_publish.py set-default-account myaccount
 python scripts/cdp_publish.py switch-account
 ```
 
-### 5. 搜索内容与查看笔记详情
+### 5. 搜索内容、查看笔记详情与评论通知抓取
 
 ```bash
 # 搜索笔记（可选筛选）
@@ -149,6 +144,15 @@ python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 -
 python scripts/cdp_publish.py get-feed-detail \
     --feed-id 67abc1234def567890123456 \
     --xsec-token YOUR_XSEC_TOKEN
+
+# 给笔记发表评论（一级评论）
+python scripts/cdp_publish.py post-comment-to-feed \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token YOUR_XSEC_TOKEN \
+    --content "写得很实用，感谢分享！"
+
+# 抓取“评论和@”通知接口（you/mentions）
+python scripts/cdp_publish.py get-notification-mentions
 ```
 
 ### 6. 获取内容数据表（content_data）
@@ -193,7 +197,6 @@ python scripts/publish_pipeline.py [选项]
   --reuse-existing-tab   优先复用已有标签页（默认关闭）
   --account NAME         指定账号
   --auto-publish         自动点击发布（跳过确认）
-  --auto-like-collect    发布后自动点赞和收藏笔记
 ```
 
 说明：启用 `--reuse-existing-tab` 后，发布流程仍会自动导航到发布页，因此会刷新到目标页面再继续执行。
@@ -224,6 +227,12 @@ python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 -
 # 获取笔记详情（支持下划线别名：get_feed_detail）
 python scripts/cdp_publish.py get-feed-detail --feed-id FEED_ID --xsec-token XSEC_TOKEN
 
+# 发表评论（支持下划线别名：post_comment_to_feed）
+python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-token XSEC_TOKEN --content "评论内容"
+
+# 抓取通知评论接口（支持下划线别名：get_notification_mentions）
+python scripts/cdp_publish.py get-notification-mentions
+
 # 获取内容数据表（支持下划线别名：content_data）
 python scripts/cdp_publish.py content-data
 python scripts/cdp_publish.py content-data --csv-file "/abs/path/content_data.csv"
@@ -237,7 +246,7 @@ python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
 
-说明：`search-feeds` 与 `get-feed-detail` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
+说明：`search-feeds`、`get-feed-detail`、`post-comment-to-feed` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
 
 ### chrome_launcher.py
@@ -267,14 +276,17 @@ python scripts/chrome_launcher.py --kill
 1. **仅供学习研究**：请遵守小红书平台规则，不要用于违规内容发布
 2. **登录安全**：Cookie 存储在本地 Chrome Profile 中，请勿泄露
 3. **选择器更新**：如果小红书页面结构变化导致发布失败，需要更新 `cdp_publish.py` 中的选择器
+4. feed 的图片类型
+- WB_PRV：预览图（preview），通常更轻、更快，适合列表卡片。
+  - WB_DFT：默认图（default），通常用于详情展示，质量/尺寸更完整。
 
 ## RoadMap
 - [x] 支持更多账号管理功能
 - [x] 支持发布功能
-- [] 增加发布后自动互动功能（点赞、收藏）
-- [] 支持自动评论、点赞
-- [] 支持素材检索功能
-- [ ] 增加更多错误处理机制
+- [x] 增加后台笔记获取功能
+- [x] 支持自动评论
+- [x] 支持素材检索功能
+- [x] 增加更多错误处理机制
 
 
 ## 许可证
