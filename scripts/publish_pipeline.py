@@ -316,6 +316,13 @@ def main():
     content_group.add_argument("--content", help="Article body text")
     content_group.add_argument("--content-file", help="Read content from UTF-8 file")
 
+    # Scheduled publishing
+    parser.add_argument(
+        "--post-time",
+        default=None,
+        help="Timer for publishing on note",
+    )
+
     # Media: images OR video (mutually exclusive)
     media_group = parser.add_mutually_exclusive_group(required=True)
     media_group.add_argument(
@@ -422,6 +429,7 @@ def main():
     reuse_existing_tab = args.reuse_existing_tab
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
     local_mode = _is_local_host(host)
+    post_time = args.post_time
 
     if timing_jitter != args.timing_jitter:
         print(
@@ -560,7 +568,7 @@ def main():
             )
         else:
             publisher.publish(
-                title=title, content=content, image_paths=image_paths
+                title=title, content=content, image_paths=image_paths, post_time=post_time
             )
         _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
         print("FILL_STATUS: READY_TO_PUBLISH")
@@ -580,7 +588,7 @@ def main():
     if should_publish:
         print("[pipeline] Step 5: Clicking publish button...")
         try:
-            note_link = publisher._click_publish()
+            note_link = publisher._click_publish(post_time != None)
             print("PUBLISH_STATUS: PUBLISHED")
             if note_link:
                 print(f"[pipeline] Note published at: {note_link}")
