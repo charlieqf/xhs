@@ -131,6 +131,7 @@ SELECTORS = {
     "content_editor_alt": 'div.ProseMirror[contenteditable="true"]',
     # Publish button
     "publish_button_text": "发布",
+    "schedule_publish_button_text": "定时发布",
     # Login indicator - URL-based check (redirect to /login if not logged in)
     "login_indicator": '.user-info, .creator-header, [class*="user"]',
 }
@@ -195,6 +196,30 @@ def _format_post_time(post_time_ms: Any) -> str:
     except Exception:
         return "-"
 
+def validate_schedule_post_time(dt_str: str | None) -> bool:
+    """
+    Validate a datetime string in the format 'yyyy-MM-dd HH:mm'.
+    
+    Rules:
+    1. If input is None or empty, return False.
+    2. The datetime format must strictly match '%Y-%m-%d %H:%M'.
+    3. The datetime must fall within the range:
+       [ current_time , current_time + 14 days ).
+       
+    Returns:
+        bool: True if valid, False otherwise.
+    """
+    if not dt_str:
+        return False
+    
+    try:
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return False
+
+    now = datetime.now().replace(second=0, microsecond=0)
+    upper_bound = now + timedelta(days=14)
+    return now <= dt < upper_bound
 
 def _format_cover_click_rate(value: Any) -> str:
     """Format cover click rate as percentage text."""
@@ -1972,6 +1997,51 @@ class XiaohongshuPublisher:
 
         raise CDPError("Could not find content editor element.")
 
+    def _set_schedule_post_time(self, post_time: str | None):
+        """Set schedle publish time if necessary"""
+        if post_time == None:
+            return
+        
+        print(f"[cdp_publish] Setting schedule publish time: {post_time}")
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
+
+        post_time_enabled = self._evaluate(f"""
+            (async function() {{
+                try {{
+                    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+                    // Click scheduled publish btn
+                    var selector = '.post-time-wrapper .d-switch';
+                    var element = document.querySelector(selector);
+                    element.click();
+                    await sleep(150);
+                    
+                    // Set publish time
+                    const el = document.querySelector('.date-picker-container input');
+                    if (el == null) {{
+                        return 'Schedule publish date-picker input is missing.';
+                    }}
+                    var nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    el.focus();
+                    nativeSetter.call(el, '{post_time}');
+
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return 'ok';
+                }} catch (err) {{
+                    return String(err);
+                }}
+            }})();
+        """)
+
+        if not post_time_enabled == 'ok':
+            raise CDPError("Could not set scheduled publish time. Reason:" + post_time_enabled)
+        
+        print("[cdp_publish] Schedule publish time set.")
+        return
+
     def _like_note(self):
         """Like the current note."""
         print("[cdp_publish] Liking note...")
@@ -2098,12 +2168,12 @@ class XiaohongshuPublisher:
             })
             time.sleep(0.05)
 
-    def _click_publish(self):
+    def _click_publish(self, scheduled: bool = False):
         """Click the publish button using CDP mouse events."""
         print("[cdp_publish] Clicking publish button...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
 
-        btn_text = SELECTORS["publish_button_text"]
+        btn_text = SELECTORS["schedule_publish_button_text"] if scheduled else SELECTORS["publish_button_text"]
 
         # JavaScript to locate the publish button and return its bounding rect
         js_get_rect = f"""
@@ -2167,6 +2237,7 @@ class XiaohongshuPublisher:
         title: str,
         content: str,
         image_paths: list[str] | None = None,
+        post_time: str | None = None,
     ):
         """
         Execute the full publish workflow:
@@ -2175,17 +2246,25 @@ class XiaohongshuPublisher:
         3. Upload images (this triggers the editor to appear)
         4. Fill title
         5. Fill content
+        6. Set schedule publish time (if necessary)
 
         Args:
             title: Article title
             content: Article body text (paragraphs separated by newlines)
             image_paths: List of local file paths to images to upload
+            post_time: Optional scheduled publish time (e.g. "2026-03-01 10:00")
         """
         if not self.ws:
             raise CDPError("Not connected. Call connect() first.")
 
         if not image_paths:
             raise CDPError("At least one image is required to publish on Xiaohongshu.")
+        
+        if post_time and not validate_schedule_post_time(post_time):
+            raise CDPError(
+                "Scheduled publish time is invalid. "
+                "It must follow the format 'yyyy-MM-dd HH:mm' and fall within the next 14 days."
+            )
 
         # Step 1: Navigate to publish page
         self._navigate(XHS_CREATOR_URL)
@@ -2202,6 +2281,9 @@ class XiaohongshuPublisher:
 
         # Step 5: Fill content
         self._fill_content(content)
+
+        # Step 6: Set schedule publish time (if provided)
+        self._set_schedule_post_time(post_time)
 
         print(
             "\n[cdp_publish] Content has been filled in.\n"
