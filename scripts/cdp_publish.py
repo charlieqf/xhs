@@ -13,6 +13,13 @@ CLI usage:
     python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
     python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN
     python cdp_publish.py [--host HOST] [--port PORT] post-comment-to-feed --feed-id FEED_ID --xsec-token TOKEN --content "评论内容"
+    python cdp_publish.py [--host HOST] [--port PORT] respond-comment --feed-id FEED_ID --xsec-token TOKEN --content "回复内容" [--comment-id ID]
+    python cdp_publish.py [--host HOST] [--port PORT] note-upvote --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] note-unvote --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] note-bookmark --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] note-unbookmark --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] profile-snapshot [--profile-url URL | --user-id USER_ID]
+    python cdp_publish.py [--host HOST] [--port PORT] notes-from-profile [--profile-url URL | --user-id USER_ID]
     python cdp_publish.py [--host HOST] [--port PORT] get-notification-mentions [--wait-seconds 18]
     python cdp_publish.py [--host HOST] [--port PORT] content-data [--page-num 1] [--page-size 10] [--type 0]
 
@@ -1099,6 +1106,764 @@ class XiaohongshuPublisher:
 
         print(f"[cdp_publish] Feed detail loaded. feed_id={feed_id}")
         return detail
+
+    def _resolve_profile_url(
+        self,
+        profile_url: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        """Resolve user profile URL from explicit URL or user_id."""
+        if isinstance(profile_url, str) and profile_url.strip():
+            return profile_url.strip()
+        if isinstance(user_id, str) and user_id.strip():
+            return f"https://www.xiaohongshu.com/user/profile/{user_id.strip()}"
+        raise CDPError("Either --profile-url or --user-id is required.")
+
+    def get_profile_snapshot(
+        self,
+        profile_url: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Get a user profile snapshot from profile page state + DOM."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        target_url = self._resolve_profile_url(profile_url=profile_url, user_id=user_id)
+        self._navigate(target_url)
+        self._sleep(2.0, minimum_seconds=0.8)
+
+        snapshot = self._evaluate("""
+            (() => {
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const state = window.__INITIAL_STATE__ || {};
+
+                const getByKeys = (obj, keys) => {
+                    if (!obj || typeof obj !== "object") {
+                        return null;
+                    }
+                    for (const key of keys) {
+                        const value = obj[key];
+                        if (value !== undefined && value !== null && String(value).trim()) {
+                            return value;
+                        }
+                    }
+                    return null;
+                };
+
+                const queue = [state];
+                const seen = new Set();
+                let userNode = null;
+                let scanCount = 0;
+
+                while (queue.length && scanCount < 2400) {
+                    scanCount += 1;
+                    const node = queue.shift();
+                    if (!node || typeof node !== "object") {
+                        continue;
+                    }
+                    if (seen.has(node)) {
+                        continue;
+                    }
+                    seen.add(node);
+
+                    if (!Array.isArray(node)) {
+                        const idVal = getByKeys(node, [
+                            "userId", "user_id", "userid", "uid", "redId", "red_id",
+                        ]);
+                        const nameVal = getByKeys(node, [
+                            "nickname", "nickName", "name", "userName", "username",
+                        ]);
+                        const avatarVal = getByKeys(node, [
+                            "avatar", "avatarUrl", "headUrl", "image", "images",
+                        ]);
+                        if (nameVal && (idVal || avatarVal)) {
+                            userNode = node;
+                            break;
+                        }
+                    }
+
+                    if (Array.isArray(node)) {
+                        for (const item of node) {
+                            if (item && typeof item === "object") {
+                                queue.push(item);
+                            }
+                        }
+                        continue;
+                    }
+
+                    for (const key of Object.keys(node).slice(0, 120)) {
+                        const value = node[key];
+                        if (value && typeof value === "object") {
+                            queue.push(value);
+                        }
+                    }
+                }
+
+                const nameNode = document.querySelector(
+                    "h1, [class*='name'], [class*='nickname'], [class*='user-name']"
+                );
+                const bioNode = document.querySelector(
+                    "[class*='desc'], [class*='bio'], [class*='signature'], [class*='intro']"
+                );
+                const avatarNode = document.querySelector(
+                    "img[src*='avatar'], [class*='avatar'] img, img[alt*='头像']"
+                );
+                const statNodes = document.querySelectorAll(
+                    "[class*='fans'], [class*='follow'], [class*='like'], [class*='count']"
+                );
+                const statTexts = [];
+                for (const node of statNodes) {
+                    if (!(node instanceof HTMLElement) || node.offsetParent === null) {
+                        continue;
+                    }
+                    const text = normalize(node.innerText || node.textContent);
+                    if (text && text.length <= 40) {
+                        statTexts.push(text);
+                    }
+                }
+
+                return {
+                    url: window.location.href,
+                    page_title: document.title || "",
+                    profile: {
+                        user_id: getByKeys(userNode, [
+                            "userId", "user_id", "userid", "uid", "redId", "red_id",
+                        ]),
+                        nickname: getByKeys(userNode, [
+                            "nickname", "nickName", "name", "userName", "username",
+                        ]) || normalize(nameNode ? nameNode.textContent : ""),
+                        avatar: getByKeys(userNode, [
+                            "avatar", "avatarUrl", "headUrl", "image", "images",
+                        ]) || (avatarNode instanceof HTMLImageElement ? avatarNode.src : ""),
+                        desc: getByKeys(userNode, [
+                            "desc", "description", "bio", "signature", "introduction",
+                        ]) || normalize(bioNode ? bioNode.textContent : ""),
+                        followers: getByKeys(userNode, [
+                            "fans", "fansCount", "followerCount", "followers", "fans_count",
+                        ]),
+                        following: getByKeys(userNode, [
+                            "follows", "followCount", "followingCount", "following",
+                        ]),
+                        liked: getByKeys(userNode, [
+                            "likes", "likedCount", "totalLikes", "likeCount", "like_count",
+                        ]),
+                    },
+                    dom_stat_texts: Array.from(new Set(statTexts)).slice(0, 12),
+                };
+            })()
+        """)
+        if not isinstance(snapshot, dict):
+            raise CDPError("Could not extract profile snapshot from current page.")
+        return snapshot
+
+    def _extract_note_cards_from_profile_dom(self, limit: int) -> dict[str, Any]:
+        """Extract note cards from current profile page DOM."""
+        safe_limit = max(1, int(limit))
+        script = """
+            (() => {
+                const limit = __LIMIT__;
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const toAbs = (href) => {
+                    try {
+                        return new URL(href, window.location.href).href;
+                    } catch (error) {
+                        return "";
+                    }
+                };
+                const parseLink = (href) => {
+                    const abs = toAbs(href);
+                    if (!abs) {
+                        return null;
+                    }
+                    let parsed;
+                    try {
+                        parsed = new URL(abs);
+                    } catch (error) {
+                        return null;
+                    }
+                    const match = parsed.pathname.match(
+                        /\\/(?:explore|discovery\\/item)\\/([0-9a-zA-Z]{24})/
+                    );
+                    if (!match) {
+                        return null;
+                    }
+                    return {
+                        id: match[1],
+                        xsec_token: parsed.searchParams.get("xsec_token") || "",
+                        url: parsed.toString(),
+                    };
+                };
+
+                const selectorList = [
+                    "a[href*='/explore/']",
+                    "a[href*='/discovery/item/']",
+                ];
+                const links = document.querySelectorAll(selectorList.join(","));
+                const seen = new Set();
+                const notes = [];
+
+                for (const link of links) {
+                    if (!(link instanceof HTMLAnchorElement)) {
+                        continue;
+                    }
+                    const parsed = parseLink(link.getAttribute("href") || link.href || "");
+                    if (!parsed) {
+                        continue;
+                    }
+                    if (seen.has(parsed.id)) {
+                        continue;
+                    }
+                    seen.add(parsed.id);
+
+                    const card = link.closest(
+                        "[class*='note-item'], [class*='card'], [class*='cover'], li, article, div"
+                    ) || link;
+                    const titleNode = card.querySelector(
+                        "[class*='title'], [class*='name'], h3, h2, img[alt]"
+                    );
+                    const coverNode = card.querySelector("img");
+                    const titleText = normalize(
+                        (titleNode && (titleNode.getAttribute("alt") || titleNode.textContent)) ||
+                        link.getAttribute("title") ||
+                        link.textContent
+                    );
+                    const cover = coverNode instanceof HTMLImageElement ? coverNode.src : "";
+
+                    notes.push({
+                        id: parsed.id,
+                        xsec_token: parsed.xsec_token,
+                        note_url: parsed.url,
+                        title: titleText,
+                        cover,
+                    });
+                    if (notes.length >= limit) {
+                        break;
+                    }
+                }
+
+                return {
+                    ok: true,
+                    notes,
+                    count: notes.length,
+                    page_url: window.location.href,
+                };
+            })()
+        """
+        result = self._evaluate(script.replace("__LIMIT__", str(safe_limit)))
+
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": "invalid_dom_payload", "notes": []}
+        return result
+
+    def list_profile_notes(
+        self,
+        profile_url: str | None = None,
+        user_id: str | None = None,
+        limit: int = 20,
+        max_scrolls: int = 3,
+    ) -> dict[str, Any]:
+        """List notes from a user profile page."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        safe_limit = max(1, min(100, int(limit)))
+        safe_scrolls = max(0, min(12, int(max_scrolls)))
+        target_url = self._resolve_profile_url(profile_url=profile_url, user_id=user_id)
+
+        self._navigate(target_url)
+        self._sleep(2.0, minimum_seconds=0.8)
+
+        best_notes: list[dict[str, Any]] = []
+        page_url = target_url
+
+        for _ in range(safe_scrolls + 1):
+            extracted = self._extract_note_cards_from_profile_dom(limit=safe_limit)
+            notes = extracted.get("notes", []) if isinstance(extracted, dict) else []
+            if isinstance(extracted, dict) and extracted.get("page_url"):
+                page_url = str(extracted["page_url"])
+            if isinstance(notes, list) and len(notes) > len(best_notes):
+                best_notes = notes
+            if len(best_notes) >= safe_limit:
+                break
+            self._evaluate("window.scrollTo(0, document.body.scrollHeight); true;")
+            self._sleep(1.2, minimum_seconds=0.4)
+
+        return {
+            "profile_url": page_url,
+            "count": len(best_notes),
+            "limit": safe_limit,
+            "notes": best_notes[:safe_limit],
+        }
+
+    def _activate_reply_target_for_comment(
+        self,
+        comment_id: str | None = None,
+        comment_author: str | None = None,
+        comment_snippet: str | None = None,
+    ) -> dict[str, Any]:
+        """Find a comment target and click its reply control."""
+        id_literal = json.dumps((comment_id or "").strip(), ensure_ascii=False)
+        author_literal = json.dumps((comment_author or "").strip(), ensure_ascii=False)
+        snippet_literal = json.dumps((comment_snippet or "").strip(), ensure_ascii=False)
+
+        script = """
+            (() => {
+                const targetId = __TARGET_ID__;
+                const targetAuthor = __TARGET_AUTHOR__;
+                const targetSnippet = __TARGET_SNIPPET__;
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 6 &&
+                    node.getBoundingClientRect().height > 6
+                );
+                const extractCommentId = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return "";
+                    }
+                    const attrs = [
+                        "data-comment-id",
+                        "data-id",
+                        "comment-id",
+                        "id",
+                    ];
+                    for (const key of attrs) {
+                        const value = node.getAttribute(key);
+                        if (value && normalize(value)) {
+                            return normalize(value);
+                        }
+                    }
+                    if (node.dataset) {
+                        const values = [
+                            node.dataset.commentId,
+                            node.dataset.id,
+                            node.dataset.commentid,
+                        ];
+                        for (const value of values) {
+                            if (value && normalize(value)) {
+                                return normalize(value);
+                            }
+                        }
+                    }
+                    return "";
+                };
+                const findReplyControl = (container) => {
+                    const selectors = [
+                        "button",
+                        "[role='button']",
+                        "a",
+                        "span",
+                        "div",
+                    ];
+                    for (const selector of selectors) {
+                        const nodes = container.querySelectorAll(selector);
+                        for (const node of nodes) {
+                            if (!visible(node)) {
+                                continue;
+                            }
+                            const text = normalize(node.textContent || node.innerText);
+                            if (!text) {
+                                continue;
+                            }
+                            if (
+                                text === "回复" ||
+                                text.startsWith("回复") ||
+                                text === "Reply" ||
+                                text.startsWith("Reply")
+                            ) {
+                                return node;
+                            }
+                        }
+                    }
+                    return null;
+                };
+
+                const containers = [];
+                const containerSelectors = [
+                    "[class*='comment-item']",
+                    "li[class*='comment']",
+                    "div[class*='comment']",
+                    "article[class*='comment']",
+                ];
+                for (const selector of containerSelectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!(node instanceof HTMLElement) || !visible(node)) {
+                            continue;
+                        }
+                        containers.push(node);
+                    }
+                }
+                if (!containers.length) {
+                    return { ok: false, reason: "comment_not_found" };
+                }
+
+                let best = null;
+                for (let idx = 0; idx < containers.length; idx++) {
+                    const container = containers[idx];
+                    const id = extractCommentId(container);
+                    const authorNode = container.querySelector(
+                        "[class*='author'], [class*='name'], [class*='user']"
+                    );
+                    const author = normalize(authorNode ? authorNode.textContent : "");
+                    const text = normalize(container.innerText || container.textContent);
+                    let score = 0;
+                    if (!targetId && !targetAuthor && !targetSnippet) {
+                        score = 1;
+                    }
+                    if (targetId && id && id === targetId) {
+                        score += 100;
+                    }
+                    if (targetAuthor && author && author.includes(targetAuthor)) {
+                        score += 30;
+                    }
+                    if (targetSnippet && text && text.includes(targetSnippet)) {
+                        score += 20;
+                    }
+                    if (!best || score > best.score) {
+                        best = {
+                            score,
+                            index: idx,
+                            id,
+                            author,
+                            text_preview: text.slice(0, 160),
+                            container,
+                        };
+                    }
+                }
+
+                if (!best || best.score <= 0) {
+                    return { ok: false, reason: "target_comment_not_matched" };
+                }
+
+                const replyControl = findReplyControl(best.container);
+                if (!replyControl) {
+                    return {
+                        ok: false,
+                        reason: "reply_button_not_found",
+                        matched_comment_id: best.id,
+                        matched_author: best.author,
+                    };
+                }
+                replyControl.click();
+                return {
+                    ok: true,
+                    matched_comment_id: best.id,
+                    matched_author: best.author,
+                    matched_text_preview: best.text_preview,
+                };
+            })()
+        """
+        result = self._evaluate(
+            script
+            .replace("__TARGET_ID__", id_literal)
+            .replace("__TARGET_AUTHOR__", author_literal)
+            .replace("__TARGET_SNIPPET__", snippet_literal)
+        )
+        if not isinstance(result, dict):
+            return {"ok": False, "reason": "unexpected_reply_target_result"}
+        return result
+
+    def respond_comment(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        content: str,
+        comment_id: str | None = None,
+        comment_author: str | None = None,
+        comment_snippet: str | None = None,
+    ) -> dict[str, Any]:
+        """Reply to an existing comment on a feed detail page."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        content = content.strip()
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+        if not content:
+            raise CDPError("content cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(2, minimum_seconds=1.0)
+        self._check_feed_page_accessible()
+
+        target_result = self._activate_reply_target_for_comment(
+            comment_id=comment_id,
+            comment_author=comment_author,
+            comment_snippet=comment_snippet,
+        )
+        if not target_result.get("ok"):
+            raise CDPError(
+                "Failed to locate reply target comment: "
+                f"{target_result.get('reason', 'unknown')}"
+            )
+
+        self._sleep(0.6, minimum_seconds=0.2)
+        filled_len = self._fill_comment_content(content)
+        self._sleep(0.6, minimum_seconds=0.2)
+
+        submit_rect_js = """
+            (function() {
+                const selectors = [
+                    "div.bottom button.submit",
+                    "div.bottom button[class*='submit']",
+                    "button.submit",
+                    "button[class*='submit']",
+                    "button[type='submit']",
+                ];
+                for (const selector of selectors) {
+                    const el = document.querySelector(selector);
+                    if (!(el instanceof HTMLButtonElement) || el.offsetParent === null) {
+                        continue;
+                    }
+                    if (el.disabled) {
+                        continue;
+                    }
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                const fallbackTexts = new Set(["发送", "提交", "评论", "回复"]);
+                const buttons = document.querySelectorAll("button");
+                for (const button of buttons) {
+                    if (!(button instanceof HTMLButtonElement) || button.offsetParent === null) {
+                        continue;
+                    }
+                    if (button.disabled) {
+                        continue;
+                    }
+                    const text = (button.textContent || "").replace(/\\s+/g, " ").trim();
+                    if (!fallbackTexts.has(text)) {
+                        continue;
+                    }
+                    const r = button.getBoundingClientRect();
+                    if (r.width < 8 || r.height < 8) {
+                        continue;
+                    }
+                    return { x: r.x, y: r.y, width: r.width, height: r.height };
+                }
+                return null;
+            })();
+        """
+        self._click_element_by_cdp("comment reply submit button", submit_rect_js)
+        self._sleep(1.0, minimum_seconds=0.4)
+
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "content_length": filled_len,
+            "matched_comment_id": target_result.get("matched_comment_id", ""),
+            "matched_author": target_result.get("matched_author", ""),
+            "matched_text_preview": target_result.get("matched_text_preview", ""),
+            "success": True,
+        }
+
+    def _set_note_toggle_state(
+        self,
+        selectors: list[str],
+        desired_active: bool,
+        active_class_keywords: list[str],
+        active_text_keywords: list[str],
+    ) -> dict[str, Any]:
+        """Toggle a note action button to desired active/inactive state."""
+        selectors_literal = json.dumps(selectors, ensure_ascii=False)
+        desired_literal = "true" if desired_active else "false"
+        class_keywords_literal = json.dumps(active_class_keywords, ensure_ascii=False)
+        text_keywords_literal = json.dumps(active_text_keywords, ensure_ascii=False)
+
+        script = """
+            (async () => {
+                const selectors = __SELECTORS__;
+                const desired = __DESIRED__;
+                const activeClassKeywords = __CLASS_KEYWORDS__;
+                const activeTextKeywords = __TEXT_KEYWORDS__;
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                const isVisible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 6 &&
+                    node.getBoundingClientRect().height > 6
+                );
+                const isActive = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return false;
+                    }
+                    const classText = normalize(node.className || "");
+                    if (activeClassKeywords.some((kw) => classText.includes(String(kw).toLowerCase()))) {
+                        return true;
+                    }
+                    const ariaPressed = normalize(node.getAttribute("aria-pressed"));
+                    if (ariaPressed === "true") {
+                        return true;
+                    }
+                    const dataState = normalize(node.getAttribute("data-state"));
+                    if (dataState && ["active", "on", "selected", "checked", "true"].includes(dataState)) {
+                        return true;
+                    }
+                    const text = normalize(node.innerText || node.textContent || "");
+                    return activeTextKeywords.some((kw) => text.includes(normalize(String(kw))));
+                };
+                const resolveClickable = (node) => {
+                    if (!(node instanceof HTMLElement)) {
+                        return null;
+                    }
+                    return node.closest("button, [role='button'], a, div") || node;
+                };
+                const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+                const candidates = [];
+                const seen = new Set();
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const raw of nodes) {
+                        const clickable = resolveClickable(raw);
+                        if (!(clickable instanceof HTMLElement) || !isVisible(clickable)) {
+                            continue;
+                        }
+                        if (seen.has(clickable)) {
+                            continue;
+                        }
+                        seen.add(clickable);
+                        candidates.push(clickable);
+                    }
+                }
+                if (!candidates.length) {
+                    return { ok: false, reason: "action_button_not_found" };
+                }
+
+                const target = candidates[0];
+                const before = isActive(target);
+                if (before === desired) {
+                    return {
+                        ok: true,
+                        changed: false,
+                        state_before: before,
+                        state_after: before,
+                    };
+                }
+
+                target.click();
+                await sleep(260);
+                const after = isActive(target);
+                return {
+                    ok: true,
+                    changed: true,
+                    state_before: before,
+                    state_after: after,
+                };
+            })()
+        """
+        result = self._evaluate(
+            script
+            .replace("__SELECTORS__", selectors_literal)
+            .replace("__DESIRED__", desired_literal)
+            .replace("__CLASS_KEYWORDS__", class_keywords_literal)
+            .replace("__TEXT_KEYWORDS__", text_keywords_literal)
+        )
+        if not isinstance(result, dict) or not result.get("ok"):
+            reason = "unknown"
+            if isinstance(result, dict):
+                reason = str(result.get("reason", reason))
+            raise CDPError(f"Failed to set note action state: {reason}")
+        return result
+
+    def set_note_upvote_state(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        upvoted: bool,
+    ) -> dict[str, Any]:
+        """Set note upvote (like) state."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(2, minimum_seconds=1.0)
+        self._check_feed_page_accessible()
+
+        result = self._set_note_toggle_state(
+            selectors=[
+                ".like-button",
+                "button[aria-label*='like']",
+                "button[aria-label*='赞']",
+                "[class*='like']",
+                "[class*='heart']",
+                "[data-testid*='like']",
+                "[data-testid*='heart']",
+            ],
+            desired_active=upvoted,
+            active_class_keywords=["liked", "active", "on", "selected"],
+            active_text_keywords=["已赞", "取消赞"],
+        )
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "target_state": "upvoted" if upvoted else "not_upvoted",
+            "changed": bool(result.get("changed")),
+            "state_before": bool(result.get("state_before")),
+            "state_after": bool(result.get("state_after")),
+            "success": True,
+        }
+
+    def set_note_bookmark_state(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        bookmarked: bool,
+    ) -> dict[str, Any]:
+        """Set note bookmark (favorite/collect) state."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+        feed_id = feed_id.strip()
+        xsec_token = xsec_token.strip()
+        if not feed_id:
+            raise CDPError("feed_id cannot be empty.")
+        if not xsec_token:
+            raise CDPError("xsec_token cannot be empty.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        self._navigate(detail_url)
+        self._sleep(2, minimum_seconds=1.0)
+        self._check_feed_page_accessible()
+
+        result = self._set_note_toggle_state(
+            selectors=[
+                ".collect-button",
+                "button[aria-label*='collect']",
+                "button[aria-label*='收藏']",
+                "[class*='collect']",
+                "[class*='bookmark']",
+                "[data-testid*='collect']",
+                "[data-testid*='bookmark']",
+            ],
+            desired_active=bookmarked,
+            active_class_keywords=["collected", "bookmarked", "active", "on", "selected"],
+            active_text_keywords=["已收藏", "取消收藏"],
+        )
+        return {
+            "feed_id": feed_id,
+            "xsec_token": xsec_token,
+            "target_state": "bookmarked" if bookmarked else "not_bookmarked",
+            "changed": bool(result.get("changed")),
+            "state_before": bool(result.get("state_before")),
+            "state_after": bool(result.get("state_after")),
+            "success": True,
+        }
 
     def _check_feed_page_accessible(self):
         """
@@ -2447,6 +3212,82 @@ def main():
     p_comment_content.add_argument("--content", help="Comment content")
     p_comment_content.add_argument("--content-file", help="Read comment content from file")
 
+    # respond-comment - reply to an existing comment on feed detail
+    p_reply = sub.add_parser(
+        "respond-comment",
+        aliases=["respond_comment"],
+        help="Reply to an existing comment on feed detail",
+    )
+    p_reply.add_argument("--feed-id", required=True, help="Feed id")
+    p_reply.add_argument("--xsec-token", required=True, help="xsec token")
+    p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
+    p_reply_content.add_argument("--content", help="Reply content")
+    p_reply_content.add_argument("--content-file", help="Read reply content from file")
+    p_reply.add_argument("--comment-id", help="Target comment id")
+    p_reply.add_argument("--comment-author", help="Target comment author name (fuzzy match)")
+    p_reply.add_argument("--comment-snippet", help="Target comment text snippet (fuzzy match)")
+
+    # profile-snapshot - read user profile summary
+    p_profile = sub.add_parser(
+        "profile-snapshot",
+        aliases=["profile_snapshot"],
+        help="Get user profile snapshot from profile page",
+    )
+    p_profile_target = p_profile.add_mutually_exclusive_group(required=True)
+    p_profile_target.add_argument("--profile-url", help="Full profile URL")
+    p_profile_target.add_argument("--user-id", help="User id for profile URL composition")
+
+    # notes-from-profile - list notes from user profile page
+    p_profile_notes = sub.add_parser(
+        "notes-from-profile",
+        aliases=["notes_from_profile"],
+        help="List notes from profile page",
+    )
+    p_profile_notes_target = p_profile_notes.add_mutually_exclusive_group(required=True)
+    p_profile_notes_target.add_argument("--profile-url", help="Full profile URL")
+    p_profile_notes_target.add_argument("--user-id", help="User id for profile URL composition")
+    p_profile_notes.add_argument("--limit", type=int, default=20, help="Max notes to return (default: 20)")
+    p_profile_notes.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=3,
+        help="Extra scroll rounds for lazy-loaded notes (default: 3)",
+    )
+
+    # note-upvote / note-unvote - toggle like state
+    p_upvote = sub.add_parser(
+        "note-upvote",
+        aliases=["note_upvote"],
+        help="Set note to upvoted state",
+    )
+    p_upvote.add_argument("--feed-id", required=True, help="Feed id")
+    p_upvote.add_argument("--xsec-token", required=True, help="xsec token")
+
+    p_unvote = sub.add_parser(
+        "note-unvote",
+        aliases=["note_unvote"],
+        help="Set note to not-upvoted state",
+    )
+    p_unvote.add_argument("--feed-id", required=True, help="Feed id")
+    p_unvote.add_argument("--xsec-token", required=True, help="xsec token")
+
+    # note-bookmark / note-unbookmark - toggle favorite state
+    p_bookmark = sub.add_parser(
+        "note-bookmark",
+        aliases=["note_bookmark"],
+        help="Set note to bookmarked state",
+    )
+    p_bookmark.add_argument("--feed-id", required=True, help="Feed id")
+    p_bookmark.add_argument("--xsec-token", required=True, help="xsec token")
+
+    p_unbookmark = sub.add_parser(
+        "note-unbookmark",
+        aliases=["note_unbookmark"],
+        help="Set note to not-bookmarked state",
+    )
+    p_unbookmark.add_argument("--feed-id", required=True, help="Feed id")
+    p_unbookmark.add_argument("--xsec-token", required=True, help="xsec token")
+
     # get-notification-mentions - capture notification mentions API response
     p_mentions = sub.add_parser(
         "get-notification-mentions",
@@ -2703,6 +3544,115 @@ def main():
                 content=comment_content,
             )
             print("POST_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("respond-comment", "respond_comment"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            reply_content = args.content
+            if args.content_file:
+                with open(args.content_file, encoding="utf-8") as f:
+                    reply_content = f.read().strip()
+            if not reply_content:
+                print("Error: --content or --content-file required.", file=sys.stderr)
+                sys.exit(1)
+
+            payload = publisher.respond_comment(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                content=reply_content,
+                comment_id=args.comment_id,
+                comment_author=args.comment_author,
+                comment_snippet=args.comment_snippet,
+            )
+            print("RESPOND_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("profile-snapshot", "profile_snapshot"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.get_profile_snapshot(
+                profile_url=args.profile_url,
+                user_id=args.user_id,
+            )
+            print("PROFILE_SNAPSHOT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("notes-from-profile", "notes_from_profile"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.list_profile_notes(
+                profile_url=args.profile_url,
+                user_id=args.user_id,
+                limit=args.limit,
+                max_scrolls=args.max_scrolls,
+            )
+            print("PROFILE_NOTES_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("note-upvote", "note_upvote"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.set_note_upvote_state(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                upvoted=True,
+            )
+            print("NOTE_UPVOTE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("note-unvote", "note_unvote"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.set_note_upvote_state(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                upvoted=False,
+            )
+            print("NOTE_UNVOTE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("note-bookmark", "note_bookmark"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.set_note_bookmark_state(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                bookmarked=True,
+            )
+            print("NOTE_BOOKMARK_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("note-unbookmark", "note_unbookmark"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.set_note_bookmark_state(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                bookmarked=False,
+            )
+            print("NOTE_UNBOOKMARK_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         elif args.command in ("get-notification-mentions", "get_notification_mentions"):

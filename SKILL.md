@@ -16,7 +16,7 @@ metadata:
 
 优先按以下顺序判断：
 1. 用户明确要求"测试浏览器 / 启动浏览器 / 检查登录 / 只打开不发布"：进入测试浏览器流程。
-2. 用户要求“搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `get-feed-detail` / `post-comment-to-feed` / `get-notification-mentions` / `content-data`）。
+2. 用户要求“搜索笔记 / 找内容 / 查看某篇笔记详情 / 查看内容数据表 / 给帖子评论 / 回复评论 / 点赞收藏互动 / 查看用户主页 / 查看评论和@通知”：进入内容检索与互动流程（`search-feeds` / `get-feed-detail` / `post-comment-to-feed` / `respond-comment` / `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark` / `profile-snapshot` / `notes-from-profile` / `get-notification-mentions` / `content-data`）。
 3. 用户已提供 `标题 + 正文 + 视频(本地路径或URL)`：直接进入视频发布流程。
 4. 用户已提供 `标题 + 正文 + 图片(本地路径或URL)`：直接进入图文发布流程。
 5. 用户只提供网页 URL：先提取网页内容与图片/视频，再给出可发布草稿，等待用户确认。
@@ -59,9 +59,12 @@ metadata:
 2. 执行 `search-feeds` 获取笔记列表（默认会先抓取搜索下拉推荐词，结果字段为 `recommended_keywords`）。
 3. 若用户需要详情，从搜索结果中取 `id` + `xsecToken` 再执行 `get-feed-detail`。
 4. 若用户需要发表评论，执行 `post-comment-to-feed`（一级评论；必填 `feed_id` / `xsec_token` / `content`）。
-5. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
-6. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
-7. 回传结构化结果（数量、核心字段、链接）。
+5. 若用户需要回复某条评论，执行 `respond-comment`（可用 `comment_id` / `comment_author` / `comment_snippet` 定位目标评论）。
+6. 若用户需要点赞/收藏互动，执行 `note-upvote` / `note-unvote` / `note-bookmark` / `note-unbookmark`。
+7. 若用户需要用户主页信息，执行 `profile-snapshot` 或 `notes-from-profile`。
+8. 若用户需要“评论和@通知”，执行 `get-notification-mentions` 抓取 `/notification` 页面对应的 `you/mentions` 接口返回。
+9. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
+10. 回传结构化结果（数量、核心字段、链接）。
 
 ## 常用命令
 
@@ -285,6 +288,29 @@ python scripts/cdp_publish.py get-notification-mentions
 
 # 下划线别名
 python scripts/cdp_publish.py get_notification_mentions
+```
+
+### 9) 评论回复 / 点赞收藏 / 用户主页信息
+
+```bash
+# 回复评论（支持按评论ID / 作者 / 文本片段定位）
+python scripts/cdp_publish.py respond-comment \
+  --feed-id 67abc1234def567890123456 \
+  --xsec-token XSEC_TOKEN \
+  --comment-id COMMENT_ID \
+  --content "感谢反馈～"
+
+# 点赞 / 取消点赞
+python scripts/cdp_publish.py note-upvote --feed-id 67abc1234def567890123456 --xsec-token XSEC_TOKEN
+python scripts/cdp_publish.py note-unvote --feed-id 67abc1234def567890123456 --xsec-token XSEC_TOKEN
+
+# 收藏 / 取消收藏
+python scripts/cdp_publish.py note-bookmark --feed-id 67abc1234def567890123456 --xsec-token XSEC_TOKEN
+python scripts/cdp_publish.py note-unbookmark --feed-id 67abc1234def567890123456 --xsec-token XSEC_TOKEN
+
+# 用户主页快照 / 用户主页笔记
+python scripts/cdp_publish.py profile-snapshot --user-id USER_ID
+python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --max-scrolls 3
 ```
 
 ## 失败处理

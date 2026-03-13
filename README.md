@@ -16,6 +16,9 @@
 - **登录状态缓存**：`check_login/check_home_login` 默认本地缓存 12 小时，减少重复跳转校验
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据）
 - **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
+- **评论回复**：支持按评论定位条件（评论 ID / 作者 / 文本片段）回复指定评论
+- **互动动作控制**：支持对指定笔记执行点赞/取消点赞、收藏/取消收藏
+- **用户页信息提取**：支持抓取用户主页快照与主页笔记列表
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
 - **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
 
@@ -144,7 +147,7 @@ python scripts/cdp_publish.py set-default-account myaccount
 python scripts/cdp_publish.py switch-account
 ```
 
-### 5. 搜索内容、查看笔记详情与评论通知抓取
+### 5. 搜索内容、查看笔记详情与互动操作
 
 ```bash
 # 搜索笔记（可选筛选）
@@ -161,6 +164,25 @@ python scripts/cdp_publish.py post-comment-to-feed \
     --feed-id 67abc1234def567890123456 \
     --xsec-token YOUR_XSEC_TOKEN \
     --content "写得很实用，感谢分享！"
+
+# 回复指定评论（可按评论ID / 作者 / 文本片段定位）
+python scripts/cdp_publish.py respond-comment \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token YOUR_XSEC_TOKEN \
+    --comment-id COMMENT_ID \
+    --content "感谢你的反馈～"
+
+# 点赞 / 取消点赞
+python scripts/cdp_publish.py note-upvote --feed-id 67abc1234def567890123456 --xsec-token YOUR_XSEC_TOKEN
+python scripts/cdp_publish.py note-unvote --feed-id 67abc1234def567890123456 --xsec-token YOUR_XSEC_TOKEN
+
+# 收藏 / 取消收藏
+python scripts/cdp_publish.py note-bookmark --feed-id 67abc1234def567890123456 --xsec-token YOUR_XSEC_TOKEN
+python scripts/cdp_publish.py note-unbookmark --feed-id 67abc1234def567890123456 --xsec-token YOUR_XSEC_TOKEN
+
+# 用户主页快照 / 用户主页笔记列表
+python scripts/cdp_publish.py profile-snapshot --user-id USER_ID
+python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --max-scrolls 3
 
 # 抓取“评论和@”通知接口（you/mentions）
 python scripts/cdp_publish.py get-notification-mentions
@@ -247,6 +269,21 @@ python scripts/cdp_publish.py get-feed-detail --feed-id FEED_ID --xsec-token XSE
 # 发表评论（支持下划线别名：post_comment_to_feed）
 python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-token XSEC_TOKEN --content "评论内容"
 
+# 回复评论（支持下划线别名：respond_comment）
+python scripts/cdp_publish.py respond-comment --feed-id FEED_ID --xsec-token XSEC_TOKEN --content "回复内容" [--comment-id COMMENT_ID]
+
+# 点赞/取消点赞（支持下划线别名：note_upvote / note_unvote）
+python scripts/cdp_publish.py note-upvote --feed-id FEED_ID --xsec-token XSEC_TOKEN
+python scripts/cdp_publish.py note-unvote --feed-id FEED_ID --xsec-token XSEC_TOKEN
+
+# 收藏/取消收藏（支持下划线别名：note_bookmark / note_unbookmark）
+python scripts/cdp_publish.py note-bookmark --feed-id FEED_ID --xsec-token XSEC_TOKEN
+python scripts/cdp_publish.py note-unbookmark --feed-id FEED_ID --xsec-token XSEC_TOKEN
+
+# 用户主页快照/主页笔记（支持下划线别名：profile_snapshot / notes_from_profile）
+python scripts/cdp_publish.py profile-snapshot --profile-url "https://www.xiaohongshu.com/user/profile/USER_ID"
+python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --max-scrolls 3
+
 # 抓取通知评论接口（支持下划线别名：get_notification_mentions）
 python scripts/cdp_publish.py get-notification-mentions
 
@@ -263,7 +300,7 @@ python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
 
-说明：`search-feeds`、`get-feed-detail`、`post-comment-to-feed` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
+说明：`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
