@@ -458,9 +458,9 @@ class XiaohongshuPublisher:
         for attempt in range(2):
             try:
                 resp = requests.get(
-                    url, 
-                    timeout=5, 
-                    proxies={"http": None, "https": None}
+                    url,
+                    timeout=5,
+                    proxies={"http": None, "https": None} if _is_local_host(self.host) else None,
                 )
                 resp.raise_for_status()
                 return resp.json()
@@ -514,7 +514,7 @@ class XiaohongshuPublisher:
         resp = requests.put(
             f"http://{self.host}:{self.port}/json/new?{XHS_CREATOR_URL}",
             timeout=5,
-            proxies={"http": None, "https": None}
+            proxies={"http": None, "https": None} if _is_local_host(self.host) else None,
         )
         if resp.ok:
             ws_url = resp.json().get("webSocketDebuggerUrl", "")
