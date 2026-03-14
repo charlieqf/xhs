@@ -175,6 +175,8 @@ python scripts/publish_pipeline.py --headless \
 ```
 
 说明：当控制端在 WSL 运行，且传入 Windows/UNC 路径（如 `\\wsl.localhost\...`）时，可加 `--skip-file-check`，避免 Linux 侧 `os.path.isfile()` 误判不存在。
+说明：脚本会自动识别 `C:\...`、`\\wsl.localhost\...` 等 Windows/UNC 路径，并在传给 `DOM.setFileInputFiles` 时保留原始路径形态。
+说明：若需要强制保留原始路径，也可显式加 `--preserve-upload-paths`。
 
 ### 3.5) 视频发布（本地视频文件 / 视频 URL）
 
@@ -302,6 +304,6 @@ python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --
 
 - 登录失败：提示用户重新扫码登录并重试；若用户需要远程展示二维码，可改用 `get-login-qrcode`。
 - 图片/视频下载失败：提示更换 URL 或改用本地文件。
-- 本地路径不可用：优先改用绝对路径；若为 WSL/远程 CDP 的 Windows/UNC 路径，可尝试 `--skip-file-check`。
+- 本地路径不可用：优先改用绝对路径；若为 WSL/远程 CDP 的 Windows/UNC 路径，可先尝试 `--skip-file-check`，必要时再加 `--preserve-upload-paths`。
 - 评论/回复目标未定位成功：提示补充 `comment_id`，或改用 `comment_author` / `comment_snippet` 再试。
 - 页面选择器失效：提示检查 `scripts/cdp_publish.py` 中选择器并更新。

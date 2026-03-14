@@ -6,10 +6,10 @@ publishing articles on Xiaohongshu (RED) creator center.
 
 CLI usage:
     # Basic commands
-    python cdp_publish.py [--host HOST] [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--host HOST] [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--host HOST] [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
-    python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] check-login [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
+    python cdp_publish.py [--host HOST] [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
+    python cdp_publish.py [--host HOST] [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
+    python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab] [--preserve-upload-paths]
     python cdp_publish.py [--host HOST] [--port PORT] get-login-qrcode [--wait-seconds 20]
     python cdp_publish.py [--host HOST] [--port PORT] list-feeds
     python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
@@ -326,6 +326,7 @@ class XiaohongshuPublisher:
         port: int = CDP_PORT,
         timing_jitter: float = 0.25,
         account_name: str | None = None,
+        preserve_upload_paths: bool = False,
     ):
         self.host = host
         self.port = port
@@ -333,10 +334,44 @@ class XiaohongshuPublisher:
         self._msg_id = 0
         self.timing_jitter = _normalize_timing_jitter(timing_jitter)
         self.account_name = (account_name or "default").strip() or "default"
+        self.preserve_upload_paths = bool(preserve_upload_paths)
         self.command_timeout_seconds = CDP_COMMAND_TIMEOUT
         self.login_cache_ttl_hours = DEFAULT_LOGIN_CACHE_TTL_HOURS
         self.login_cache_ttl_seconds = self.login_cache_ttl_hours * 3600
         self.login_cache_file = LOGIN_CACHE_FILE
+
+    def _prepare_upload_file_path(self, file_path: str) -> str:
+        """Return the file path to send to DOM.setFileInputFiles."""
+        if self._should_preserve_upload_path(file_path):
+            return file_path
+        return file_path.replace("\\", "/")
+
+    def _looks_like_windows_drive_path(self, file_path: str) -> bool:
+        """Return True when the path looks like a Windows drive-letter path."""
+        return len(file_path) >= 3 and file_path[0].isalpha() and file_path[1] == ":" and file_path[2] in ("\\", "/")
+
+    def _looks_like_unc_path(self, file_path: str) -> bool:
+        """Return True when the path looks like a UNC path."""
+        return file_path.startswith("\\\\") or file_path.startswith("//")
+
+    def _looks_like_windows_backslash_path(self, file_path: str) -> bool:
+        """Return True when the path likely follows Windows-style backslash syntax."""
+        if "\\" not in file_path or "/" in file_path:
+            return False
+        if file_path.startswith("\\"):
+            return True
+        parts = [part for part in file_path.split("\\") if part]
+        return len(parts) >= 2
+
+    def _should_preserve_upload_path(self, file_path: str) -> bool:
+        """Return True when upload path should be preserved as-is."""
+        if self.preserve_upload_paths:
+            return True
+        return (
+            self._looks_like_windows_drive_path(file_path)
+            or self._looks_like_unc_path(file_path)
+            or self._looks_like_windows_backslash_path(file_path)
+        )
 
     def _login_cache_key(self, scope: str) -> str:
         """Build a unique cache key for one login scope."""
@@ -3471,12 +3506,16 @@ class XiaohongshuPublisher:
             print("[cdp_publish] No images to upload, skipping.")
             return
 
-        # Normalize paths (forward slashes for CDP)
-        normalized = [p.replace("\\", "/") for p in image_paths]
+        preserve_flags = [self._should_preserve_upload_path(path) for path in image_paths]
+        prepared_paths = [self._prepare_upload_file_path(path) for path in image_paths]
 
         print(f"[cdp_publish] Uploading {len(image_paths)} image(s)...")
+        if self.preserve_upload_paths:
+            print("[cdp_publish] Upload path normalization disabled; preserving original paths.")
+        elif any(preserve_flags):
+            print("[cdp_publish] Auto-detected Windows/UNC upload paths; preserving original paths.")
 
-        for index, file_path in enumerate(normalized, start=1):
+        for index, file_path in enumerate(prepared_paths, start=1):
             node_id = 0
             selectors = (
                 (SELECTORS["upload_input"], SELECTORS["upload_input_alt"])
@@ -3498,7 +3537,7 @@ class XiaohongshuPublisher:
                 "nodeId": node_id,
                 "files": [file_path],
             })
-            print(f"[cdp_publish] Image {index}/{len(normalized)} submitted: {file_path}")
+            print(f"[cdp_publish] Image {index}/{len(prepared_paths)} submitted: {file_path}")
             self._wait_for_uploaded_images(index)
             self._sleep(0.9, minimum_seconds=0.25)
 
@@ -3507,8 +3546,13 @@ class XiaohongshuPublisher:
 
     def _upload_video(self, video_path: str):
         """Upload a video file via the file input element."""
-        normalized = video_path.replace("\\", "/")
-        print(f"[cdp_publish] Uploading video: {normalized}")
+        preserve_path = self._should_preserve_upload_path(video_path)
+        prepared_path = self._prepare_upload_file_path(video_path)
+        print(f"[cdp_publish] Uploading video: {prepared_path}")
+        if self.preserve_upload_paths:
+            print("[cdp_publish] Upload path normalization disabled; preserving original paths.")
+        elif preserve_path:
+            print("[cdp_publish] Auto-detected Windows/UNC upload path; preserving original path.")
 
         node_id = 0
         for selector in (SELECTORS["upload_input"], SELECTORS["upload_input_alt"]):
@@ -3525,7 +3569,7 @@ class XiaohongshuPublisher:
         # Set the video file
         self._send("DOM.setFileInputFiles", {
             "nodeId": node_id,
-            "files": [normalized],
+            "files": [prepared_path],
         })
 
         print("[cdp_publish] Video file submitted. Waiting for processing...")
@@ -4040,6 +4084,15 @@ def main():
             "Useful in headed mode to reduce foreground focus switching."
         ),
     )
+    parser.add_argument(
+        "--preserve-upload-paths",
+        action="store_true",
+        help=(
+            "Force preserving original upload file paths instead of converting "
+            "backslashes to forward slashes before DOM.setFileInputFiles. "
+            "Windows/UNC paths are auto-detected by default."
+        ),
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # check-login
@@ -4384,6 +4437,7 @@ def main():
         port=port,
         timing_jitter=timing_jitter,
         account_name=cache_account_name,
+        preserve_upload_paths=args.preserve_upload_paths,
     )
     try:
         if args.command == "check-login":

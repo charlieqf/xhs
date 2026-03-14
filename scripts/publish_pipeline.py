@@ -29,6 +29,9 @@ Usage:
     # Skip local file check (for WSL/remote CDP + Windows/UNC paths)
     python publish_pipeline.py --title "标题" --content "正文" --images "\\\\wsl.localhost\\Ubuntu\\home\\me\\a.jpg" --skip-file-check
 
+    # Preserve original Windows/UNC upload paths
+    python publish_pipeline.py --title "标题" --content "正文" --images "\\\\wsl.localhost\\Ubuntu\\home\\me\\a.jpg" --skip-file-check --preserve-upload-paths
+
     # Publish a video (local file)
     python publish_pipeline.py --title "标题" --content "正文" --video video.mp4
 
@@ -399,6 +402,16 @@ def main():
             "or using remote CDP with Windows/UNC paths."
         ),
     )
+    parser.add_argument(
+        "--preserve-upload-paths",
+        action="store_true",
+        default=False,
+        help=(
+            "Force preserving original upload file paths instead of converting "
+            "backslashes to forward slashes before DOM.setFileInputFiles. "
+            "Windows/UNC paths are auto-detected by default."
+        ),
+    )
 
     # Account selection
     parser.add_argument(
@@ -493,6 +506,7 @@ def main():
         port=port,
         timing_jitter=timing_jitter,
         account_name=cache_account_name,
+        preserve_upload_paths=args.preserve_upload_paths,
     )
     try:
         publisher.connect(reuse_existing_tab=reuse_existing_tab)

@@ -249,6 +249,7 @@ python scripts/publish_pipeline.py [选项]
   --image-urls URL...    图片 URL 列表
   --images FILE...       本地图片文件列表
   --skip-file-check      跳过本地媒体文件存在性检查（WSL/远程 CDP/UNC 路径可用）
+  --preserve-upload-paths 强制保留原始上传路径，不将反斜杠转换为正斜杠
   --host HOST            CDP 主机地址（默认 127.0.0.1）
   --port PORT            CDP 端口（默认 9222）
   --headless             无头模式（无浏览器窗口）
@@ -261,6 +262,8 @@ python scripts/publish_pipeline.py [选项]
 说明：启用 `--reuse-existing-tab` 后，发布流程仍会自动导航到发布页，因此会刷新到目标页面再继续执行。
 说明：当 `--host` 非 `127.0.0.1/localhost` 时为远程模式，会跳过本地 `chrome_launcher.py` 的自动启动/重启逻辑，请确保远程 CDP 地址可达。
 说明：当控制端运行在 WSL、但媒体路径使用 Windows/UNC（如 `\\wsl.localhost\...`）时，可加 `--skip-file-check` 跳过 Linux 侧 `isfile` 预校验。
+说明：脚本现在会自动识别 `C:\...`、`\\wsl.localhost\...` 等 Windows/UNC 路径，并在传给 `DOM.setFileInputFiles` 时保留原始形态。
+说明：若仍想强制关闭路径改写，可显式加 `--preserve-upload-paths`。
 说明：`publish_pipeline.py` 默认会自动点击发布；如需人工确认，请显式加 `--preview`。
 
 ### cdp_publish.py
