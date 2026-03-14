@@ -7,14 +7,17 @@
 
 ## 功能特性
 - **自动化发布**：自动填写标题、正文、上传图片
+- **创作者中心兼容修复**：适配 2026 年 2-3 月发布页 DOM 变动（发布按钮、定时开关、日期输入、多图上传等待、正文编辑器）
 - **话题标签自动写入**：识别正文最后一行 `#标签`，然后逐渐写入
 - **多账号支持**：支持管理多个小红书账号，各账号 Cookie 隔离
 - **无头模式**：支持后台运行，无需显示浏览器窗口
 - **远程 CDP 支持**：可通过 `--host` / `--port` 连接远程 Chrome 调试端口
 - **图片下载**：支持从 URL 自动下载图片，自动添加 Referer 绕过防盗链
 - **登录检测**：自动检测登录状态，未登录时自动切换到有窗口模式扫码
+- **登录二维码导出**：支持返回登录二维码 Base64 图片，便于远程前端展示扫码
 - **登录状态缓存**：`check_login/check_home_login` 默认本地缓存 12 小时，减少重复跳转校验
-- **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据）
+- **首页推荐流抓取**：支持抓取首页推荐 feed 列表
+- **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据），详情可选滚动加载更多评论/回复
 - **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
 - **评论回复**：支持按评论定位条件（评论 ID / 作者 / 文本片段）回复指定评论
 - **互动动作控制**：支持对指定笔记执行点赞/取消点赞、收藏/取消收藏
@@ -46,6 +49,8 @@ python scripts/cdp_publish.py login
 
 在弹出的 Chrome 窗口中扫码登录小红书。
 
+说明：当前发布链路已按 2026 年 2-3 月的小红书创作者中心改版调整过选择器与等待策略；如果后续再次改版，优先检查 `scripts/cdp_publish.py` 中的 `SELECTORS`、多图上传等待和发布按钮点击逻辑。
+
 ### 2. 启动/测试浏览器（不发布）
 
 ```bash
@@ -57,6 +62,9 @@ python scripts/chrome_launcher.py --headless
 
 # 检查当前登录状态
 python scripts/cdp_publish.py check-login
+
+# 获取登录二维码（返回 Base64，可供远程前端直接展示）
+python scripts/cdp_publish.py get-login-qrcode
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
 python scripts/cdp_publish.py check-login --reuse-existing-tab
@@ -150,6 +158,9 @@ python scripts/cdp_publish.py switch-account
 ### 5. 搜索内容、查看笔记详情与互动操作
 
 ```bash
+# 首页推荐列表
+python scripts/cdp_publish.py list-feeds
+
 # 搜索笔记（可选筛选）
 python scripts/cdp_publish.py search-feeds --keyword "春招"
 python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
@@ -158,6 +169,16 @@ python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 -
 python scripts/cdp_publish.py get-feed-detail \
     --feed-id 67abc1234def567890123456 \
     --xsec-token YOUR_XSEC_TOKEN
+
+# 可选：滚动加载更多一级评论，并尝试展开二级回复
+python scripts/cdp_publish.py get-feed-detail \
+    --feed-id 67abc1234def567890123456 \
+    --xsec-token YOUR_XSEC_TOKEN \
+    --load-all-comments \
+    --limit 20 \
+    --click-more-replies \
+    --reply-limit 10 \
+    --scroll-speed normal
 
 # 给笔记发表评论（一级评论）
 python scripts/cdp_publish.py post-comment-to-feed \
@@ -188,7 +209,8 @@ python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --
 python scripts/cdp_publish.py get-notification-mentions
 ```
 
-说明：`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
+说明：`list-feeds` 返回首页推荐 feed 列表；`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
+说明：`get-feed-detail --load-all-comments` 会在详情页滚动评论区，并可选点击“更多回复”后再提取 `window.__INITIAL_STATE__`。
 
 ### 6. 获取内容数据表（content_data）
 
@@ -259,12 +281,19 @@ python scripts/cdp_publish.py --host 10.0.0.12 --port 9222 fill --title "标题"
 # 点击发布按钮
 python scripts/cdp_publish.py click-publish
 
+# 获取登录二维码（支持下划线别名：get_login_qrcode）
+python scripts/cdp_publish.py get-login-qrcode
+
+# 首页推荐列表（支持下划线别名：list_feeds）
+python scripts/cdp_publish.py list-feeds
+
 # 搜索笔记（支持下划线别名：search_feeds）
 python scripts/cdp_publish.py search-feeds --keyword "春招"
 python scripts/cdp_publish.py search-feeds --keyword "春招" --sort-by 最新 --note-type 图文
 
 # 获取笔记详情（支持下划线别名：get_feed_detail）
 python scripts/cdp_publish.py get-feed-detail --feed-id FEED_ID --xsec-token XSEC_TOKEN
+python scripts/cdp_publish.py get-feed-detail --feed-id FEED_ID --xsec-token XSEC_TOKEN --load-all-comments --limit 20 --click-more-replies --reply-limit 10 --scroll-speed normal
 
 # 发表评论（支持下划线别名：post_comment_to_feed）
 python scripts/cdp_publish.py post-comment-to-feed --feed-id FEED_ID --xsec-token XSEC_TOKEN --content "评论内容"
@@ -300,9 +329,11 @@ python scripts/cdp_publish.py set-default-account NAME
 python scripts/cdp_publish.py switch-account
 ```
 
-说明：`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
+说明：`list-feeds`、`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
+说明：`get-login-qrcode` 返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
 说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
+说明：`get-feed-detail --load-all-comments` 额外返回 `comment_loading`，用于说明评论滚动加载结果。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
 
 ### chrome_launcher.py

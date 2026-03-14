@@ -10,8 +10,10 @@ CLI usage:
     python cdp_publish.py [--host HOST] [--port PORT] fill --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
     python cdp_publish.py [--host HOST] [--port PORT] publish --title "标题" --content "正文" --images img1.jpg [--headless] [--account NAME] [--reuse-existing-tab]
     python cdp_publish.py [--host HOST] [--port PORT] click-publish [--headless] [--account NAME] [--reuse-existing-tab]
+    python cdp_publish.py [--host HOST] [--port PORT] get-login-qrcode [--wait-seconds 20]
+    python cdp_publish.py [--host HOST] [--port PORT] list-feeds
     python cdp_publish.py [--host HOST] [--port PORT] search-feeds --keyword "关键词" [--sort-by 综合|最新|最多点赞|最多评论|最多收藏]
-    python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN
+    python cdp_publish.py [--host HOST] [--port PORT] get-feed-detail --feed-id FEED_ID --xsec-token TOKEN [--load-all-comments]
     python cdp_publish.py [--host HOST] [--port PORT] post-comment-to-feed --feed-id FEED_ID --xsec-token TOKEN --content "评论内容"
     python cdp_publish.py [--host HOST] [--port PORT] respond-comment --feed-id FEED_ID --xsec-token TOKEN --content "回复内容" [--comment-id ID]
     python cdp_publish.py [--host HOST] [--port PORT] note-upvote --feed-id FEED_ID --xsec-token TOKEN
@@ -51,9 +53,9 @@ import time
 import sys
 import csv
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 from typing import Any
 
 # Add scripts dir to path so sibling modules can be imported in both
@@ -96,7 +98,7 @@ CDP_HOST = "127.0.0.1"
 CDP_PORT = 9222
 
 # Xiaohongshu URLs
-XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish"
+XHS_CREATOR_URL = "https://creator.xiaohongshu.com/publish/publish?source=official"
 XHS_HOME_URL = "https://www.xiaohongshu.com"
 XHS_NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
 XHS_CREATOR_LOGIN_CHECK_URL = "https://creator.xiaohongshu.com"
@@ -119,7 +121,7 @@ XHS_FEED_INACCESSIBLE_KEYWORDS = (
 )
 
 # DOM selectors (update these when Xiaohongshu changes their page structure)
-# Last verified: 2026-02
+# Last verified against creator center changes landed by 2026-03.
 SELECTORS = {
     # "上传图文" tab - must click before uploading images
     "image_text_tab": "div.creator-tab",
@@ -128,17 +130,23 @@ SELECTORS = {
     "video_tab": "div.creator-tab",
     "video_tab_text": "上传视频",
     # Upload area - the file input element for images (visible after clicking tab)
-    "upload_input": "input.upload-input",
+    "upload_input": ".upload-input",
     "upload_input_alt": 'input[type="file"]',
     # Title input field (visible after image upload)
-    "title_input": 'input[placeholder*="填写标题"]',
-    "title_input_alt": "input.d-text",
-    # Content editor area - TipTap/ProseMirror contenteditable div
+    "title_input": "div.d-input input",
+    "title_input_alt": 'input[placeholder*="填写标题"], input[placeholder*="标题"], input.d-text',
+    # Content editor area - current creator center may expose TipTap, ProseMirror or Quill.
     "content_editor": "div.tiptap.ProseMirror",
     "content_editor_alt": 'div.ProseMirror[contenteditable="true"]',
+    "content_editor_alt2": "div.ql-editor",
+    "content_placeholder_text": "输入正文描述",
     # Publish button
+    "publish_button": ".publish-page-publish-btn button.bg-red",
     "publish_button_text": "发布",
     "schedule_publish_button_text": "定时发布",
+    "schedule_switch": ".post-time-wrapper .d-switch",
+    "schedule_datetime_input": ".date-picker-container input",
+    "image_preview_items": ".img-preview-area .pr",
     # Login indicator - URL-based check (redirect to /login if not logged in)
     "login_indicator": '.user-info, .creator-header, [class*="user"]',
 }
@@ -151,6 +159,7 @@ VIDEO_PROCESS_TIMEOUT = 120  # seconds to wait for video processing
 VIDEO_PROCESS_POLL = 3  # seconds between video processing status checks
 ACTION_INTERVAL = 1  # seconds between actions
 MAX_TIMING_JITTER_RATIO = 0.7
+CDP_COMMAND_TIMEOUT = 15.0
 DEFAULT_LOGIN_CACHE_TTL_HOURS = 12.0
 LOGIN_CACHE_FILE = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "tmp", "login_status_cache.json")
@@ -324,6 +333,7 @@ class XiaohongshuPublisher:
         self._msg_id = 0
         self.timing_jitter = _normalize_timing_jitter(timing_jitter)
         self.account_name = (account_name or "default").strip() or "default"
+        self.command_timeout_seconds = CDP_COMMAND_TIMEOUT
         self.login_cache_ttl_hours = DEFAULT_LOGIN_CACHE_TTL_HOURS
         self.login_cache_ttl_seconds = self.login_cache_ttl_hours * 3600
         self.login_cache_file = LOGIN_CACHE_FILE
@@ -540,27 +550,256 @@ class XiaohongshuPublisher:
     # CDP command helpers
     # ------------------------------------------------------------------
 
-    def _send(self, method: str, params: dict | None = None) -> dict:
-        """Send a CDP command and return the result."""
+    def _send(
+        self,
+        method: str,
+        params: dict | None = None,
+        timeout_seconds: float | None = None,
+    ) -> dict:
+        """Send a CDP command and return the result with a bounded wait."""
         if not self.ws:
             raise CDPError("Not connected. Call connect() first.")
 
         self._msg_id += 1
-        msg = {"id": self._msg_id, "method": method}
+        message_id = self._msg_id
+        msg = {"id": message_id, "method": method}
         if params:
             msg["params"] = params
 
         self.ws.send(json.dumps(msg))
+        timeout = float(timeout_seconds or self.command_timeout_seconds)
+        deadline = time.monotonic() + max(0.1, timeout)
 
         # Wait for the matching response
         while True:
-            raw = self.ws.recv()
-            data = json.loads(raw)
-            if data.get("id") == self._msg_id:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CDPError(
+                    f"Timed out waiting for CDP response to {method} "
+                    f"after {timeout:.1f}s."
+                )
+
+            try:
+                raw = self.ws.recv(timeout=max(0.1, remaining))
+            except TimeoutError as exc:
+                raise CDPError(
+                    f"Timed out waiting for CDP response to {method} "
+                    f"after {timeout:.1f}s."
+                ) from exc
+            except Exception as exc:
+                raise CDPError(f"CDP receive failed while waiting for {method}: {exc}") from exc
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise CDPError(
+                    f"Received invalid CDP JSON while waiting for {method}: {exc}"
+                ) from exc
+
+            if data.get("id") == message_id:
                 if "error" in data:
                     raise CDPError(f"CDP error: {data['error']}")
                 return data.get("result", {})
             # else: it's an event, skip it
+
+    def _build_content_data_result(
+        self,
+        payload: dict[str, Any],
+        request_url: str,
+        page_num: int,
+        page_size: int,
+        note_type: int,
+        capture_mode: str,
+    ) -> dict[str, Any]:
+        """Normalize content-data API payload into CLI output."""
+        data = payload.get("data")
+        note_infos = data.get("note_infos") if isinstance(data, dict) else []
+        if not isinstance(note_infos, list):
+            note_infos = []
+        rows = _map_note_infos_to_content_rows(note_infos)
+
+        query = parse_qs(urlparse(request_url).query)
+
+        def _query_int(name: str, default: int) -> int:
+            raw = (query.get(name) or [str(default)])[0]
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "request_url": request_url,
+            "requested_page_num": page_num,
+            "requested_page_size": page_size,
+            "requested_type": note_type,
+            "resolved_page_num": _query_int("page_num", page_num),
+            "resolved_page_size": _query_int("page_size", page_size),
+            "resolved_type": _query_int("type", note_type),
+            "total": data.get("total") if isinstance(data, dict) else None,
+            "count_returned": len(rows),
+            "rows": rows,
+            "capture_mode": capture_mode,
+        }
+
+    def _fetch_content_data_via_page_fetch(
+        self,
+        page_num: int,
+        page_size: int,
+        note_type: int,
+    ) -> dict[str, Any]:
+        """Fetch content-data API from browser page context using explicit params."""
+        query = urlencode(
+            {
+                "page_num": page_num,
+                "page_size": page_size,
+                "type": note_type,
+            }
+        )
+        request_path = f"{XHS_CONTENT_DATA_API_PATH}?{query}"
+        result = self._evaluate(f"""
+            (async () => {{
+                try {{
+                    const response = await fetch({json.dumps(request_path)}, {{
+                        method: "GET",
+                        credentials: "include",
+                        cache: "no-store",
+                        headers: {{
+                            "Accept": "application/json, text/plain, */*"
+                        }}
+                    }});
+                    const body = await response.text();
+                    return {{
+                        ok: response.ok,
+                        status: response.status,
+                        url: response.url,
+                        body,
+                    }};
+                }} catch (error) {{
+                    return {{
+                        ok: false,
+                        status: 0,
+                        url: {json.dumps(request_path)},
+                        error: String(error),
+                        body: "",
+                    }};
+                }}
+            }})()
+        """)
+
+        if not isinstance(result, dict):
+            raise CDPError("Unexpected page-fetch result for content data API.")
+
+        if not result.get("ok"):
+            raise CDPError(
+                "Content data page fetch failed: "
+                f"status={result.get('status')}, error={result.get('error') or 'unknown'}"
+            )
+
+        body_text = result.get("body", "")
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise CDPError(
+                "Failed to decode content data API JSON from page fetch: "
+                f"{exc}; preview={body_text[:300]}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise CDPError("Unexpected content data payload structure.")
+
+        return self._build_content_data_result(
+            payload=payload,
+            request_url=str(result.get("url") or request_path),
+            page_num=page_num,
+            page_size=page_size,
+            note_type=note_type,
+            capture_mode="page_fetch",
+        )
+
+    def _capture_content_data_from_page_request(
+        self,
+        page_num: int,
+        page_size: int,
+        note_type: int,
+    ) -> dict[str, Any]:
+        """Fallback: capture the page-triggered content-data request via CDP."""
+        self._send("Page.enable")
+        self._send("Network.enable", {"maxPostDataSize": 65536})
+        self._send("Page.navigate", {"url": XHS_CONTENT_DATA_URL})
+
+        request_url_by_id: dict[str, str] = {}
+        target_request_id = ""
+        target_request_url = ""
+        deadline = time.time() + 18
+
+        while time.time() < deadline:
+            timeout = min(1.0, max(0.1, deadline - time.time()))
+            try:
+                raw = self.ws.recv(timeout=timeout)
+            except TimeoutError:
+                continue
+
+            message = json.loads(raw)
+            method = message.get("method")
+            params = message.get("params", {})
+
+            if method == "Network.requestWillBeSent":
+                request_id = params.get("requestId")
+                request = params.get("request", {})
+                if isinstance(request_id, str):
+                    request_url_by_id[request_id] = request.get("url", "")
+                continue
+
+            if method == "Network.responseReceived":
+                request_id = params.get("requestId")
+                if not isinstance(request_id, str):
+                    continue
+
+                request_url = request_url_by_id.get(request_id, "")
+                if XHS_CONTENT_DATA_API_PATH not in request_url:
+                    continue
+
+                status = params.get("response", {}).get("status")
+                if status != 200:
+                    raise CDPError(
+                        "Content data API responded with non-200 status: "
+                        f"{status}, url={request_url}"
+                    )
+
+                target_request_id = request_id
+                target_request_url = request_url
+                break
+
+        if not target_request_id:
+            raise CDPError(
+                "Timed out waiting for content data request. "
+                "Please open data-analysis page manually and retry."
+            )
+
+        body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
+        body_text = body_result.get("body", "")
+        if body_result.get("base64Encoded"):
+            body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
+
+        try:
+            payload = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            raise CDPError(
+                "Failed to decode content data API JSON: "
+                f"{exc}; preview={body_text[:300]}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise CDPError("Unexpected content data payload structure.")
+
+        return self._build_content_data_result(
+            payload=payload,
+            request_url=target_request_url,
+            page_num=page_num,
+            page_size=page_size,
+            note_type=note_type,
+            capture_mode="network_capture",
+        )
 
     def _evaluate(self, expression: str) -> Any:
         """Execute JavaScript in the page and return the result value."""
@@ -745,6 +984,149 @@ class XiaohongshuPublisher:
             "\n[cdp_publish] Login page is open.\n"
             "  Please scan the QR code in the Chrome window to log in.\n"
         )
+
+    def _capture_clip_png_base64(self, rect: dict[str, Any], padding: int = 8) -> str:
+        """Capture a clipped PNG screenshot and return base64 payload."""
+        x = max(0.0, float(rect.get("x", 0.0)) - padding)
+        y = max(0.0, float(rect.get("y", 0.0)) - padding)
+        width = max(1.0, float(rect.get("width", 0.0)) + padding * 2)
+        height = max(1.0, float(rect.get("height", 0.0)) + padding * 2)
+
+        self._send("Page.enable")
+        result = self._send(
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "clip": {
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "scale": 1,
+                },
+                "captureBeyondViewport": True,
+            },
+        )
+        image_base64 = result.get("data", "")
+        if not isinstance(image_base64, str) or not image_base64:
+            raise CDPError("Failed to capture QR code screenshot.")
+        return image_base64
+
+    def _locate_login_qrcode(self) -> dict[str, Any]:
+        """Return visible QR code metadata from current login page when possible."""
+        result = self._evaluate(r"""
+            (() => {
+                const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width >= 24 &&
+                    node.getBoundingClientRect().height >= 24
+                );
+                const selectors = [
+                    ".login-container .qrcode-img",
+                    ".login-container img",
+                    "img.qrcode-img",
+                    "img[src*='qrcode']",
+                    "[class*='qrcode'] img",
+                    "[class*='qr'] img",
+                    "[class*='qrcode'] canvas",
+                    "[class*='qr'] canvas",
+                    ".login-container canvas",
+                ];
+
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!visible(node)) {
+                            continue;
+                        }
+                        const rect = node.getBoundingClientRect();
+                        const src = node instanceof HTMLImageElement ? (node.currentSrc || node.src || "") : "";
+                        const dataUrl = node instanceof HTMLCanvasElement ? node.toDataURL("image/png") : "";
+                        const parentText = normalize(
+                            node.parentElement ? (node.parentElement.innerText || node.parentElement.textContent) : ""
+                        );
+                        return {
+                            ok: true,
+                            tag_name: String(node.tagName || "").toLowerCase(),
+                            selector,
+                            src,
+                            data_url: dataUrl,
+                            rect: {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            },
+                            hint_text: parentText,
+                        };
+                    }
+                }
+                return { ok: false, reason: "qrcode_not_found" };
+            })()
+        """)
+        return result if isinstance(result, dict) else {"ok": False, "reason": "unexpected_result"}
+
+    def get_login_qrcode(self, wait_seconds: float = 20.0) -> dict[str, Any]:
+        """Open login page and return QR code image payload for remote display."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        self._navigate(XHS_CREATOR_LOGIN_CHECK_URL)
+        self._sleep(1.5, minimum_seconds=0.6)
+        current_url = self._evaluate("window.location.href")
+        if isinstance(current_url, str) and "login" not in current_url.lower():
+            self._navigate("https://creator.xiaohongshu.com/login")
+            self._sleep(1.5, minimum_seconds=0.6)
+            current_url = self._evaluate("window.location.href")
+
+        if isinstance(current_url, str) and "login" not in current_url.lower():
+            return {
+                "logged_in": True,
+                "current_url": current_url,
+                "qrcode_base64": "",
+                "qrcode_data_url": "",
+                "mime_type": "image/png",
+                "message": "Already logged in.",
+            }
+
+        deadline = time.time() + max(3.0, float(wait_seconds))
+        qrcode_meta: dict[str, Any] | None = None
+        while time.time() < deadline:
+            qrcode_meta = self._locate_login_qrcode()
+            if qrcode_meta.get("ok"):
+                break
+            self._sleep(0.6, minimum_seconds=0.2)
+
+        if not qrcode_meta or not qrcode_meta.get("ok"):
+            reason = qrcode_meta.get("reason", "qrcode_not_found") if isinstance(qrcode_meta, dict) else "qrcode_not_found"
+            raise CDPError(f"Failed to locate login QR code: {reason}")
+
+        data_url = qrcode_meta.get("data_url")
+        if isinstance(data_url, str) and data_url.startswith("data:image/"):
+            header, _, encoded = data_url.partition(",")
+            mime_type = header[5:].split(";", 1)[0] if header.startswith("data:") else "image/png"
+            image_base64 = encoded
+            qrcode_data_url = data_url
+        else:
+            rect = qrcode_meta.get("rect")
+            if not isinstance(rect, dict):
+                raise CDPError("QR code rect is missing.")
+            image_base64 = self._capture_clip_png_base64(rect)
+            mime_type = "image/png"
+            qrcode_data_url = f"data:{mime_type};base64,{image_base64}"
+
+        return {
+            "logged_in": False,
+            "current_url": current_url,
+            "qrcode_base64": image_base64,
+            "qrcode_data_url": qrcode_data_url,
+            "mime_type": mime_type,
+            "selector": qrcode_meta.get("selector", ""),
+            "tag_name": qrcode_meta.get("tag_name", ""),
+            "hint_text": qrcode_meta.get("hint_text", ""),
+        }
 
     # ------------------------------------------------------------------
     # Feed discovery actions
@@ -1078,11 +1460,402 @@ class XiaohongshuPublisher:
             "feeds": feeds,
         }
 
-    def get_feed_detail(self, feed_id: str, xsec_token: str) -> dict[str, Any]:
+    def list_feeds(self) -> dict[str, Any]:
+        """Get home recommendation feed list from current logged-in home page."""
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        self._navigate(XHS_HOME_URL)
+        self._sleep(2, minimum_seconds=1.0)
+
+        explorer = FeedExplorer(self._evaluate, self._sleep)
+        try:
+            feeds = explorer.list_feeds()
+        except FeedExplorerError as e:
+            raise CDPError(str(e)) from e
+
+        print(f"[cdp_publish] Home feeds loaded. count={len(feeds)}")
+        return {
+            "count": len(feeds),
+            "feeds": feeds,
+        }
+
+    def _extract_feed_comments_state(self) -> dict[str, Any]:
+        """Read current comment loading state from feed detail page DOM."""
+        result = self._evaluate(r"""
+            (() => {
+                const normalize = (text) => (text || "").replace(/\s+/g, " ").trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 6 &&
+                    node.getBoundingClientRect().height > 6
+                );
+
+                const countVisible = (selector) => {
+                    const nodes = document.querySelectorAll(selector);
+                    let count = 0;
+                    for (const node of nodes) {
+                        if (visible(node)) {
+                            count += 1;
+                        }
+                    }
+                    return count;
+                };
+
+                let parentCommentCount = 0;
+                const parentSelectors = [
+                    ".parent-comment",
+                    "[class*='parent-comment']",
+                    ".comments-container [class*='comment-item']",
+                ];
+                for (const selector of parentSelectors) {
+                    parentCommentCount = countVisible(selector);
+                    if (parentCommentCount > 0) {
+                        break;
+                    }
+                }
+
+                let totalComments = 0;
+                const totalSelectors = [
+                    ".comments-container .total",
+                    ".comments-container [class*='total']",
+                ];
+                for (const selector of totalSelectors) {
+                    const node = document.querySelector(selector);
+                    if (!(node instanceof HTMLElement)) {
+                        continue;
+                    }
+                    const text = normalize(node.innerText || node.textContent);
+                    const match = text.match(/共\s*(\d+)\s*条评论/);
+                    if (match) {
+                        totalComments = Number.parseInt(match[1], 10) || 0;
+                        break;
+                    }
+                }
+
+                const noCommentSelectors = [
+                    ".no-comments-text",
+                    "[class*='no-comments']",
+                    "[class*='empty']",
+                ];
+                let noComments = false;
+                for (const selector of noCommentSelectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!visible(node)) {
+                            continue;
+                        }
+                        const text = normalize(node.innerText || node.textContent);
+                        if (text.includes("这是一片荒地")) {
+                            noComments = true;
+                            break;
+                        }
+                    }
+                    if (noComments) {
+                        break;
+                    }
+                }
+
+                const endSelectors = [
+                    ".end-container",
+                    "[class*='end-container']",
+                ];
+                let endDetected = false;
+                let endText = "";
+                for (const selector of endSelectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!visible(node)) {
+                            continue;
+                        }
+                        const text = normalize(node.innerText || node.textContent).toUpperCase();
+                        if (text.includes("THE END") || text.includes("THEEND")) {
+                            endDetected = true;
+                            endText = text;
+                            break;
+                        }
+                    }
+                    if (endDetected) {
+                        break;
+                    }
+                }
+
+                return {
+                    parent_comment_count: parentCommentCount,
+                    total_comments: totalComments,
+                    no_comments: noComments,
+                    end_detected: endDetected,
+                    end_text: endText,
+                    scroll_top: window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0,
+                };
+            })()
+        """)
+        return result if isinstance(result, dict) else {
+            "parent_comment_count": 0,
+            "total_comments": 0,
+            "no_comments": False,
+            "end_detected": False,
+            "end_text": "",
+            "scroll_top": 0,
+        }
+
+    def _scroll_feed_comments_area(
+        self,
+        speed: str = "normal",
+        large_mode: bool = False,
+        push_count: int = 1,
+    ):
+        """Scroll feed detail comments area to trigger lazy loading."""
+        speed_key = (speed or "normal").strip().lower()
+        delta_map = {
+            "slow": 260,
+            "normal": 520,
+            "fast": 860,
+        }
+        delta = delta_map.get(speed_key, delta_map["normal"])
+        if large_mode:
+            delta = int(delta * 1.9)
+        push_count = max(1, int(push_count))
+
+        for _ in range(push_count):
+            self._evaluate(f"""
+                (() => {{
+                    const commentRoot = document.querySelector('.comments-container');
+                    if (commentRoot instanceof HTMLElement) {{
+                        try {{
+                            commentRoot.scrollIntoView({{ behavior: 'instant', block: 'start' }});
+                        }} catch (error) {{}}
+                    }}
+
+                    const parents = document.querySelectorAll('.parent-comment, [class*="parent-comment"]');
+                    if (parents.length) {{
+                        const last = parents[parents.length - 1];
+                        if (last instanceof HTMLElement) {{
+                            try {{
+                                last.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                            }} catch (error) {{}}
+                        }}
+                    }}
+
+                    const target = document.querySelector('.note-scroller')
+                        || document.querySelector('.interaction-container')
+                        || document.querySelector('.comments-container')
+                        || document.documentElement;
+
+                    const event = new WheelEvent('wheel', {{
+                        deltaY: {delta},
+                        deltaMode: 0,
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                    }});
+                    target.dispatchEvent(event);
+                    window.scrollBy(0, {delta});
+                    return true;
+                }})()
+            """)
+            self._sleep(0.45 if speed_key == "fast" else 0.75 if speed_key == "normal" else 1.05, minimum_seconds=0.15)
+
+    def _click_more_reply_buttons(
+        self,
+        reply_limit: int = 10,
+        max_clicks: int = 6,
+    ) -> dict[str, int]:
+        """Click visible 'more replies' buttons on feed detail page."""
+        threshold = max(0, int(reply_limit))
+        max_clicks = max(1, int(max_clicks))
+        result = self._evaluate(rf"""
+            (() => {{
+                const normalize = (text) => (text || '').replace(/\s+/g, ' ').trim();
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 6 &&
+                    node.getBoundingClientRect().height > 6
+                );
+                const root = document.querySelector('.comments-container') || document.body;
+                const selectors = [
+                    '.show-more',
+                    '[class*="show-more"]',
+                    'button',
+                    '[role="button"]',
+                    'span',
+                    'div',
+                    'a',
+                ];
+                const seen = new Set();
+                let clicked = 0;
+                let skipped = 0;
+                const replyRegex = /展开\s*(\d+)\s*条回复/;
+
+                for (const selector of selectors) {{
+                    const nodes = root.querySelectorAll(selector);
+                    for (const node of nodes) {{
+                        if (clicked >= {max_clicks}) {{
+                            return {{ clicked, skipped }};
+                        }}
+                        if (!visible(node)) {{
+                            continue;
+                        }}
+                        const text = normalize(node.textContent || node.innerText);
+                        if (!text) {{
+                            continue;
+                        }}
+                        const looksLikeReplyExpand = (
+                            text.includes('回复') &&
+                            (text.includes('展开') || text.includes('更多') || text.includes('查看'))
+                        );
+                        if (!looksLikeReplyExpand) {{
+                            continue;
+                        }}
+                        const rect = node.getBoundingClientRect();
+                        const key = `${{Math.round(rect.x)}}:${{Math.round(rect.y)}}:${{text}}`;
+                        if (seen.has(key)) {{
+                            continue;
+                        }}
+                        seen.add(key);
+
+                        const match = text.match(replyRegex);
+                        if ({threshold} > 0 && match && Number.parseInt(match[1], 10) > {threshold}) {{
+                            skipped += 1;
+                            continue;
+                        }}
+
+                        try {{
+                            node.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                        }} catch (error) {{}}
+                        node.click();
+                        clicked += 1;
+                    }}
+                }}
+                return {{ clicked, skipped }};
+            }})()
+        """)
+        if not isinstance(result, dict):
+            return {"clicked": 0, "skipped": 0}
+        return {
+            "clicked": int(result.get("clicked", 0) or 0),
+            "skipped": int(result.get("skipped", 0) or 0),
+        }
+
+    def _load_feed_detail_comments(
+        self,
+        limit: int = 20,
+        click_more_replies: bool = False,
+        reply_limit: int = 10,
+        scroll_speed: str = "normal",
+    ) -> dict[str, Any]:
+        """Scroll and optionally expand replies to load more comments into page state."""
+        target_limit = max(1, int(limit))
+        speed = (scroll_speed or "normal").strip().lower()
+        if speed not in {"slow", "normal", "fast"}:
+            speed = "normal"
+
+        self._evaluate("""
+            (() => {
+                const root = document.querySelector('.comments-container');
+                if (root instanceof HTMLElement) {
+                    try {
+                        root.scrollIntoView({ behavior: 'instant', block: 'start' });
+                    } catch (error) {}
+                }
+                return true;
+            })()
+        """)
+        self._sleep(0.8, minimum_seconds=0.25)
+
+        initial_state = self._extract_feed_comments_state()
+        if initial_state.get("no_comments"):
+            return {
+                "attempts": 0,
+                "target_limit": target_limit,
+                "loaded_parent_comments": 0,
+                "total_comments": int(initial_state.get("total_comments", 0) or 0),
+                "clicked_more_replies": 0,
+                "skipped_more_replies": 0,
+                "end_detected": bool(initial_state.get("end_detected")),
+                "no_comments": True,
+                "scroll_speed": speed,
+            }
+
+        last_count = int(initial_state.get("parent_comment_count", 0) or 0)
+        stagnant_checks = 0
+        clicked_total = 0
+        skipped_total = 0
+        attempts = 0
+        max_attempts = max(10, target_limit * 3)
+
+        while attempts < max_attempts:
+            attempts += 1
+            state = self._extract_feed_comments_state()
+            current_count = int(state.get("parent_comment_count", 0) or 0)
+            total_comments = int(state.get("total_comments", 0) or 0)
+            end_detected = bool(state.get("end_detected"))
+            if end_detected or current_count >= target_limit:
+                break
+
+            if click_more_replies and attempts % 2 == 1:
+                click_result = self._click_more_reply_buttons(reply_limit=reply_limit)
+                clicked_total += click_result["clicked"]
+                skipped_total += click_result["skipped"]
+                if click_result["clicked"] > 0:
+                    self._sleep(0.9, minimum_seconds=0.25)
+                    click_result_round2 = self._click_more_reply_buttons(reply_limit=reply_limit)
+                    clicked_total += click_result_round2["clicked"]
+                    skipped_total += click_result_round2["skipped"]
+                    if click_result_round2["clicked"] > 0:
+                        self._sleep(0.7, minimum_seconds=0.2)
+
+            large_mode = stagnant_checks >= 3
+            push_count = 3 if large_mode else 1
+            self._scroll_feed_comments_area(speed=speed, large_mode=large_mode, push_count=push_count)
+            state_after = self._extract_feed_comments_state()
+            updated_count = int(state_after.get("parent_comment_count", 0) or 0)
+            if updated_count > last_count:
+                last_count = updated_count
+                stagnant_checks = 0
+            else:
+                stagnant_checks += 1
+                if stagnant_checks >= 6:
+                    self._scroll_feed_comments_area(speed=speed, large_mode=True, push_count=6)
+                    self._sleep(1.0, minimum_seconds=0.25)
+                    stagnant_checks = 0
+
+            if bool(state_after.get("end_detected")) or updated_count >= target_limit:
+                state = state_after
+                current_count = updated_count
+                total_comments = int(state_after.get("total_comments", 0) or 0)
+                end_detected = bool(state_after.get("end_detected"))
+                break
+
+        final_state = self._extract_feed_comments_state()
+        return {
+            "attempts": attempts,
+            "target_limit": target_limit,
+            "loaded_parent_comments": int(final_state.get("parent_comment_count", 0) or 0),
+            "total_comments": int(final_state.get("total_comments", 0) or 0),
+            "clicked_more_replies": clicked_total,
+            "skipped_more_replies": skipped_total,
+            "end_detected": bool(final_state.get("end_detected")),
+            "no_comments": bool(final_state.get("no_comments")),
+            "scroll_speed": speed,
+        }
+
+    def get_feed_detail(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        load_all_comments: bool = False,
+        limit: int = 20,
+        click_more_replies: bool = False,
+        reply_limit: int = 10,
+        scroll_speed: str = "normal",
+    ) -> dict[str, Any]:
         """
         Get feed detail from note page initial state.
 
-        Returns a detail object containing `note` and `comments` (if available).
+        Returns a payload containing the detail object and optional comment loading summary.
         """
         if not self.ws:
             raise CDPError("Not connected. Call connect() first.")
@@ -1097,6 +1870,16 @@ class XiaohongshuPublisher:
         detail_url = make_feed_detail_url(feed_id, xsec_token)
         self._navigate(detail_url)
         self._sleep(2, minimum_seconds=1.0)
+        self._check_feed_page_accessible()
+
+        comment_loading = None
+        if load_all_comments:
+            comment_loading = self._load_feed_detail_comments(
+                limit=limit,
+                click_more_replies=click_more_replies,
+                reply_limit=reply_limit,
+                scroll_speed=scroll_speed,
+            )
 
         explorer = FeedExplorer(self._evaluate, self._sleep)
         try:
@@ -1105,7 +1888,10 @@ class XiaohongshuPublisher:
             raise CDPError(str(e)) from e
 
         print(f"[cdp_publish] Feed detail loaded. feed_id={feed_id}")
-        return detail
+        return {
+            "detail": detail,
+            "comment_loading": comment_loading,
+        }
 
     def _resolve_profile_url(
         self,
@@ -2392,115 +3178,211 @@ class XiaohongshuPublisher:
             raise CDPError("--page-num must be >= 1.")
         if page_size < 1:
             raise CDPError("--page-size must be >= 1.")
-        # Important: direct fetch to this API can be rejected (e.g. 406) when
-        # anti-bot headers are not present. We therefore capture the real
-        # browser request generated by page scripts and read response body via CDP.
-        self._send("Page.enable")
-        self._send("Network.enable", {"maxPostDataSize": 65536})
-        self._send("Page.navigate", {"url": XHS_CONTENT_DATA_URL})
-
-        request_url_by_id: dict[str, str] = {}
-        target_request_id = ""
-        target_request_url = ""
-        deadline = time.time() + 18
-
-        while time.time() < deadline:
-            timeout = min(1.0, max(0.1, deadline - time.time()))
-            try:
-                raw = self.ws.recv(timeout=timeout)
-            except TimeoutError:
-                continue
-
-            message = json.loads(raw)
-            method = message.get("method")
-            params = message.get("params", {})
-
-            if method == "Network.requestWillBeSent":
-                request_id = params.get("requestId")
-                request = params.get("request", {})
-                if isinstance(request_id, str):
-                    request_url_by_id[request_id] = request.get("url", "")
-                continue
-
-            if method == "Network.responseReceived":
-                request_id = params.get("requestId")
-                if not isinstance(request_id, str):
-                    continue
-
-                request_url = request_url_by_id.get(request_id, "")
-                if XHS_CONTENT_DATA_API_PATH not in request_url:
-                    continue
-
-                status = params.get("response", {}).get("status")
-                if status != 200:
-                    raise CDPError(
-                        "Content data API responded with non-200 status: "
-                        f"{status}, url={request_url}"
-                    )
-
-                target_request_id = request_id
-                target_request_url = request_url
-                break
-
-        if not target_request_id:
-            raise CDPError(
-                "Timed out waiting for content data request. "
-                "Please open data-analysis page manually and retry."
-            )
-
-        body_result = self._send("Network.getResponseBody", {"requestId": target_request_id})
-        body_text = body_result.get("body", "")
-        if body_result.get("base64Encoded"):
-            body_text = base64.b64decode(body_text).decode("utf-8", errors="replace")
-
+        self._navigate(XHS_CONTENT_DATA_URL)
         try:
-            payload = json.loads(body_text)
-        except json.JSONDecodeError as e:
-            raise CDPError(
-                "Failed to decode content data API JSON: "
-                f"{e}; preview={body_text[:300]}"
-            ) from e
-
-        if not isinstance(payload, dict):
-            raise CDPError("Unexpected content data payload structure.")
-
-        data = payload.get("data")
-        note_infos = data.get("note_infos") if isinstance(data, dict) else []
-        if not isinstance(note_infos, list):
-            note_infos = []
-        rows = _map_note_infos_to_content_rows(note_infos)
-
-        query = parse_qs(urlparse(target_request_url).query)
-        resolved_page_num = int((query.get("page_num") or ["1"])[0])
-        resolved_page_size = int((query.get("page_size") or ["10"])[0])
-        resolved_type = int((query.get("type") or ["0"])[0])
-
-        if (
-            page_num != resolved_page_num
-            or page_size != resolved_page_size
-            or note_type != resolved_type
-        ):
-            print(
-                "[cdp_publish] Warning: Requested pagination/filter differs from "
-                "captured page request. Returning captured data instead."
+            return self._fetch_content_data_via_page_fetch(
+                page_num=page_num,
+                page_size=page_size,
+                note_type=note_type,
             )
-
-        return {
-            "request_url": target_request_url,
-            "requested_page_num": page_num,
-            "requested_page_size": page_size,
-            "requested_type": note_type,
-            "resolved_page_num": resolved_page_num,
-            "resolved_page_size": resolved_page_size,
-            "resolved_type": resolved_type,
-            "total": data.get("total") if isinstance(data, dict) else None,
-            "count_returned": len(rows),
-            "rows": rows,
-        }
+        except CDPError as exc:
+            print(
+                "[cdp_publish] Explicit content-data fetch failed, "
+                f"falling back to network capture: {exc}"
+            )
+            return self._capture_content_data_from_page_request(
+                page_num=page_num,
+                page_size=page_size,
+                note_type=note_type,
+            )
 
     # ------------------------------------------------------------------
     # Publishing actions
     # ------------------------------------------------------------------
+
+    def _query_node_id(self, selector: str) -> int:
+        """Return the first DOM node id matching selector, or 0 when absent."""
+        self._send("DOM.enable")
+        doc = self._send("DOM.getDocument")
+        root_id = doc["root"]["nodeId"]
+        result = self._send("DOM.querySelector", {
+            "nodeId": root_id,
+            "selector": selector,
+        })
+        return int(result.get("nodeId", 0) or 0)
+
+    def _count_uploaded_images(self) -> int:
+        """Estimate how many uploaded image previews are visible."""
+        count = self._evaluate(f"""
+            (() => {{
+                const selectors = [
+                    {json.dumps(SELECTORS["image_preview_items"])},
+                    ".img-preview-area [class*='preview']",
+                    ".draggable-item",
+                    "[class*='img-preview'] .pr"
+                ];
+                let maxCount = 0;
+                for (const selector of selectors) {{
+                    try {{
+                        maxCount = Math.max(maxCount, document.querySelectorAll(selector).length);
+                    }} catch (error) {{}}
+                }}
+                return maxCount;
+            }})()
+        """)
+        return int(count or 0)
+
+    def _wait_for_uploaded_images(self, expected_count: int, timeout_seconds: float = 60.0):
+        """Wait until image preview count reaches the expected value."""
+        deadline = time.time() + max(5.0, float(timeout_seconds))
+        last_count = -1
+        while time.time() < deadline:
+            current_count = self._count_uploaded_images()
+            if current_count != last_count:
+                print(
+                    "[cdp_publish] Waiting for uploaded image previews: "
+                    f"{current_count}/{expected_count}"
+                )
+                last_count = current_count
+            if current_count >= expected_count:
+                return
+            self._sleep(0.5, minimum_seconds=0.15)
+
+        raise CDPError(
+            f"Timed out waiting for image upload preview {expected_count}. "
+            "The creator page structure may have changed."
+        )
+
+    def _find_content_editor_selector(self) -> str | None:
+        """Return the best available content editor selector for the current page."""
+        placeholder_literal = json.dumps(SELECTORS["content_placeholder_text"])
+        selector = self._evaluate(f"""
+            (() => {{
+                const directSelectors = [
+                    {json.dumps(SELECTORS["content_editor"])},
+                    {json.dumps(SELECTORS["content_editor_alt"])},
+                    {json.dumps(SELECTORS["content_editor_alt2"])},
+                    "[role='textbox']",
+                ];
+                for (const selector of directSelectors) {{
+                    const node = document.querySelector(selector);
+                    if (
+                        node instanceof HTMLElement &&
+                        node.offsetParent !== null &&
+                        node.getBoundingClientRect().width > 0 &&
+                        node.getBoundingClientRect().height > 0
+                    ) {{
+                        return selector;
+                    }}
+                }}
+
+                const placeholder = {placeholder_literal};
+                const candidates = document.querySelectorAll("p[data-placeholder], div[data-placeholder]");
+                for (const node of candidates) {{
+                    const value = (node.getAttribute("data-placeholder") || "").trim();
+                    if (!value.includes(placeholder)) {{
+                        continue;
+                    }}
+                    let current = node;
+                    for (let depth = 0; depth < 5 && current; depth += 1) {{
+                        current = current.parentElement;
+                        if (
+                            current instanceof HTMLElement &&
+                            current.getAttribute("role") === "textbox"
+                        ) {{
+                            return "[role='textbox']";
+                        }}
+                    }}
+                }}
+                return null;
+            }})()
+        """)
+        return selector if isinstance(selector, str) and selector.strip() else None
+
+    def _get_publish_button_rect(self) -> dict[str, Any] | None:
+        """Locate the current publish button using current and legacy selectors."""
+        return self._evaluate(f"""
+            (() => {{
+                const buttonSelector = {json.dumps(SELECTORS["publish_button"])};
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 0 &&
+                    node.getBoundingClientRect().height > 0
+                );
+                const toRect = (node) => {{
+                    const rect = node.getBoundingClientRect();
+                    return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                }};
+
+                const button = document.querySelector(buttonSelector);
+                if (visible(button)) {{
+                    return toRect(button);
+                }}
+
+                const keywords = [
+                    {json.dumps(SELECTORS["publish_button_text"])},
+                    {json.dumps(SELECTORS["schedule_publish_button_text"])},
+                ];
+                const buttons = document.querySelectorAll("button, [role='button'], .d-button");
+                for (const node of buttons) {{
+                    if (!visible(node)) {{
+                        continue;
+                    }}
+                    const text = (node.innerText || node.textContent || "").trim();
+                    if (keywords.includes(text)) {{
+                        return toRect(node);
+                    }}
+                }}
+                return null;
+            }})()
+        """)
+
+    def _is_publish_button_ready(self) -> bool:
+        """Return True when the publish button is present, visible and not disabled."""
+        ready = self._evaluate(f"""
+            (() => {{
+                const selectors = [
+                    {json.dumps(SELECTORS["publish_button"])},
+                    "button.publishBtn",
+                ];
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 0 &&
+                    node.getBoundingClientRect().height > 0
+                );
+                for (const selector of selectors) {{
+                    const button = document.querySelector(selector);
+                    if (!visible(button)) {{
+                        continue;
+                    }}
+                    if (button.hasAttribute("disabled")) {{
+                        continue;
+                    }}
+                    const className = String(button.className || "");
+                    if (className.includes("disabled")) {{
+                        continue;
+                    }}
+                    return true;
+                }}
+                return false;
+            }})()
+        """)
+        return bool(ready)
+
+    def _wait_for_publish_button_ready(self, timeout_seconds: float = VIDEO_PROCESS_TIMEOUT):
+        """Wait until the publish button becomes interactive."""
+        deadline = time.time() + max(5.0, float(timeout_seconds))
+        while time.time() < deadline:
+            if self._is_publish_button_ready():
+                print("[cdp_publish] Publish button is ready.")
+                return
+            self._sleep(VIDEO_PROCESS_POLL, minimum_seconds=0.4)
+
+        raise CDPError(
+            f"Publish button did not become ready within {int(timeout_seconds)}s."
+        )
 
     def _click_tab(self, tab_selector: str, tab_text: str):
         """Click a publish-mode tab by selector and text content."""
@@ -2594,35 +3476,31 @@ class XiaohongshuPublisher:
 
         print(f"[cdp_publish] Uploading {len(image_paths)} image(s)...")
 
-        # Enable DOM domain
-        self._send("DOM.enable")
-
-        # Get the document root
-        doc = self._send("DOM.getDocument")
-        root_id = doc["root"]["nodeId"]
-
-        # Try primary selector, then fallback
-        node_id = 0
-        for selector in (SELECTORS["upload_input"], SELECTORS["upload_input_alt"]):
-            result = self._send("DOM.querySelector", {
-                "nodeId": root_id,
-                "selector": selector,
-            })
-            node_id = result.get("nodeId", 0)
-            if node_id:
-                break
-
-        if not node_id:
-            raise CDPError(
-                "Could not find file input element.\n"
-                "The page structure may have changed. Check references/publish-workflow.md."
+        for index, file_path in enumerate(normalized, start=1):
+            node_id = 0
+            selectors = (
+                (SELECTORS["upload_input"], SELECTORS["upload_input_alt"])
+                if index == 1
+                else (SELECTORS["upload_input_alt"], SELECTORS["upload_input"])
             )
+            for selector in selectors:
+                node_id = self._query_node_id(selector)
+                if node_id:
+                    break
 
-        # Use DOM.setFileInputFiles to set the files
-        self._send("DOM.setFileInputFiles", {
-            "nodeId": node_id,
-            "files": normalized,
-        })
+            if not node_id:
+                raise CDPError(
+                    "Could not find file input element.\n"
+                    "The page structure may have changed. Check references/publish-workflow.md."
+                )
+
+            self._send("DOM.setFileInputFiles", {
+                "nodeId": node_id,
+                "files": [file_path],
+            })
+            print(f"[cdp_publish] Image {index}/{len(normalized)} submitted: {file_path}")
+            self._wait_for_uploaded_images(index)
+            self._sleep(0.9, minimum_seconds=0.25)
 
         print("[cdp_publish] Images uploaded. Waiting for editor to appear...")
         self._sleep(UPLOAD_WAIT, minimum_seconds=2.0)
@@ -2632,21 +3510,9 @@ class XiaohongshuPublisher:
         normalized = video_path.replace("\\", "/")
         print(f"[cdp_publish] Uploading video: {normalized}")
 
-        # Enable DOM domain
-        self._send("DOM.enable")
-
-        # Get the document root
-        doc = self._send("DOM.getDocument")
-        root_id = doc["root"]["nodeId"]
-
-        # Find the file input for video upload
         node_id = 0
         for selector in (SELECTORS["upload_input"], SELECTORS["upload_input_alt"]):
-            result = self._send("DOM.querySelector", {
-                "nodeId": root_id,
-                "selector": selector,
-            })
-            node_id = result.get("nodeId", 0)
+            node_id = self._query_node_id(selector)
             if node_id:
                 break
 
@@ -2669,21 +3535,18 @@ class XiaohongshuPublisher:
 
         The Xiaohongshu creator page shows a progress/processing indicator
         while the video is being uploaded and transcoded. We wait until the
-        title input or content editor becomes available, which signals
-        that the video has been processed.
+        publish button becomes clickable, which is more reliable on the
+        current creator center than checking title/editor presence alone.
         """
         print("[cdp_publish] Waiting for video processing to complete...")
         deadline = time.time() + VIDEO_PROCESS_TIMEOUT
         last_pct = ""
 
         while time.time() < deadline:
-            # Check if the title input has appeared (signals processing done)
-            for selector in (SELECTORS["title_input"], SELECTORS["title_input_alt"]):
-                found = self._evaluate(f"!!document.querySelector('{selector}')")
-                if found:
-                    print("[cdp_publish] Video processing complete - editor is ready.")
-                    time.sleep(1)  # small extra buffer
-                    return
+            if self._is_publish_button_ready():
+                print("[cdp_publish] Video processing complete - publish button is ready.")
+                self._sleep(1.0, minimum_seconds=0.25)
+                return
 
             # Try to read progress text for user feedback
             pct = self._evaluate("""
@@ -2729,6 +3592,7 @@ class XiaohongshuPublisher:
                         nativeSetter.call(el, {escaped_title});
                         el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        el.blur();
                     }})();
                 """)
                 print("[cdp_publish] Title set.")
@@ -2737,35 +3601,76 @@ class XiaohongshuPublisher:
         raise CDPError("Could not find title input element.")
 
     def _fill_content(self, content: str):
-        """Fill in the article body content using the TipTap/ProseMirror editor."""
+        """Fill in the article body content using the current creator editor."""
         print(f"[cdp_publish] Setting content ({len(content)} chars)...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
+        selector = self._find_content_editor_selector()
+        if not selector:
+            raise CDPError("Could not find content editor element.")
 
-        for selector in (SELECTORS["content_editor"], SELECTORS["content_editor_alt"]):
-            found = self._evaluate(f"!!document.querySelector('{selector}')")
-            if found:
-                escaped = json.dumps(content)
-                self._evaluate(f"""
-                    (function() {{
-                        var el = document.querySelector('{selector}');
-                        el.focus();
-                        var text = {escaped};
-                        var paragraphs = text.split('\\n').filter(function(p) {{ return p.trim(); }});
-                        var html = [];
-                        for (var i = 0; i < paragraphs.length; i++) {{
-                            html.push('<p>' + paragraphs[i] + '</p>');
-                            if (i < paragraphs.length - 1) {{
-                                html.push('<p><br></p>');
+        escaped = json.dumps(content)
+        placeholder_literal = json.dumps(SELECTORS["content_placeholder_text"])
+        result = self._evaluate(f"""
+            (() => {{
+                const selector = {json.dumps(selector)};
+                const placeholder = {placeholder_literal};
+                let el = document.querySelector(selector);
+                if (!(el instanceof HTMLElement) || el.offsetParent === null) {{
+                    const candidates = document.querySelectorAll("p[data-placeholder], div[data-placeholder]");
+                    for (const node of candidates) {{
+                        const value = (node.getAttribute("data-placeholder") || "").trim();
+                        if (!value.includes(placeholder)) {{
+                            continue;
+                        }}
+                        let current = node;
+                        for (let depth = 0; depth < 5 && current; depth += 1) {{
+                            current = current.parentElement;
+                            if (
+                                current instanceof HTMLElement &&
+                                current.getAttribute("role") === "textbox"
+                            ) {{
+                                el = current;
+                                break;
                             }}
                         }}
-                        el.innerHTML = html.join('');
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    }})();
-                """)
-                print("[cdp_publish] Content set.")
-                return
+                        if (el instanceof HTMLElement) {{
+                            break;
+                        }}
+                    }}
+                }}
 
-        raise CDPError("Could not find content editor element.")
+                if (!(el instanceof HTMLElement)) {{
+                    return false;
+                }}
+
+                const text = {escaped};
+                const parts = text.split("\\n");
+                const lines = parts.length ? parts : [""];
+
+                el.focus();
+                while (el.firstChild) {{
+                    el.removeChild(el.firstChild);
+                }}
+
+                for (const line of lines) {{
+                    const paragraph = document.createElement("p");
+                    if (line) {{
+                        paragraph.textContent = line;
+                    }} else {{
+                        paragraph.appendChild(document.createElement("br"));
+                    }}
+                    el.appendChild(paragraph);
+                }}
+
+                el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                return true;
+            }})()
+        """)
+        if not result:
+            raise CDPError("Could not set content into creator editor.")
+
+        print(f"[cdp_publish] Content set via selector: {selector}")
 
     def _set_schedule_post_time(self, post_time: str | None):
         """Set schedle publish time if necessary"""
@@ -2779,26 +3684,39 @@ class XiaohongshuPublisher:
             (async function() {{
                 try {{
                     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                    const visible = (node) => (
+                        node instanceof HTMLElement &&
+                        node.offsetParent !== null &&
+                        node.getBoundingClientRect().width > 0 &&
+                        node.getBoundingClientRect().height > 0
+                    );
 
-                    // Click scheduled publish btn
-                    var selector = '.post-time-wrapper .d-switch';
-                    var element = document.querySelector(selector);
-                    element.click();
-                    await sleep(150);
+                    // Click scheduled publish switch if needed
+                    const switchSelector = {json.dumps(SELECTORS["schedule_switch"])};
+                    const switchElement = document.querySelector(switchSelector);
+                    if (!(switchElement instanceof HTMLElement) || !visible(switchElement)) {{
+                        return 'Schedule publish switch is missing.';
+                    }}
+                    const isChecked = switchElement.getAttribute('aria-checked');
+                    if (isChecked !== 'true') {{
+                        switchElement.click();
+                        await sleep(300);
+                    }}
                     
                     // Set publish time
-                    const el = document.querySelector('.date-picker-container input');
-                    if (el == null) {{
+                    const el = document.querySelector({json.dumps(SELECTORS["schedule_datetime_input"])});
+                    if (!(el instanceof HTMLInputElement)) {{
                         return 'Schedule publish date-picker input is missing.';
                     }}
                     var nativeSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value'
                     ).set;
                     el.focus();
-                    nativeSetter.call(el, '{post_time}');
-
+                    el.select();
+                    nativeSetter.call(el, {json.dumps(post_time)});
                     el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('blur', {{ bubbles: true }}));
                     return 'ok';
                 }} catch (err) {{
                     return String(err);
@@ -2942,40 +3860,18 @@ class XiaohongshuPublisher:
         """Click the publish button using CDP mouse events."""
         print("[cdp_publish] Clicking publish button...")
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
+        self._wait_for_publish_button_ready(timeout_seconds=20.0)
+        rect = self._get_publish_button_rect()
+        if not rect:
+            raise CDPError(
+                "Could not find publish button. "
+                "The creator center page structure may have changed."
+            )
 
-        btn_text = SELECTORS["schedule_publish_button_text"] if scheduled else SELECTORS["publish_button_text"]
-
-        # JavaScript to locate the publish button and return its bounding rect
-        js_get_rect = f"""
-            (function() {{
-                // Strategy 1: search <button> elements by exact text
-                var buttons = document.querySelectorAll('button');
-                for (var i = 0; i < buttons.length; i++) {{
-                    var t = buttons[i].textContent.trim();
-                    if (t === '{btn_text}') {{
-                        var r = buttons[i].getBoundingClientRect();
-                        return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
-                    }}
-                }}
-                // Strategy 2: search d-button-content / d-text spans
-                var spans = document.querySelectorAll(
-                    '.d-button-content .d-text, .d-button-content span'
-                );
-                for (var i = 0; i < spans.length; i++) {{
-                    if (spans[i].textContent.trim() === '{btn_text}') {{
-                        var el = spans[i].closest(
-                            'button, [role="button"], .d-button, [class*="btn"], [class*="button"]'
-                        );
-                        if (!el) el = spans[i];
-                        var r = el.getBoundingClientRect();
-                        return {{ x: r.x, y: r.y, width: r.width, height: r.height }};
-                    }}
-                }}
-                return null;
-            }})();
-        """
-
-        self._click_element_by_cdp("publish button", js_get_rect)
+        cx = rect["x"] + rect["width"] / 2
+        cy = rect["y"] + rect["height"] / 2
+        print(f"[cdp_publish] Clicking publish button at ({cx:.0f}, {cy:.0f})...")
+        self._click_mouse(cx, cy)
         print("[cdp_publish] Publish button clicked.")
 
         # Wait for publish success and get note link
@@ -3149,6 +4045,18 @@ def main():
     # check-login
     sub.add_parser("check-login", help="Check login status (exit 0=logged in, 1=not)")
 
+    p_qrcode = sub.add_parser(
+        "get-login-qrcode",
+        aliases=["get_login_qrcode"],
+        help="Get login QR code image payload for remote display",
+    )
+    p_qrcode.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=20.0,
+        help="Seconds to wait for QR code to appear (default: 20)",
+    )
+
     # fill - fill form without clicking publish
     p_fill = sub.add_parser("fill", help="Fill title/content/images or video without publishing")
     p_fill.add_argument("--title", required=True)
@@ -3169,6 +4077,12 @@ def main():
 
     # click-publish - just click the publish button on current page
     sub.add_parser("click-publish", help="Click publish button on already-filled page")
+
+    p_list_feeds = sub.add_parser(
+        "list-feeds",
+        aliases=["list_feeds"],
+        help="Get home recommendation feeds",
+    )
 
     # search-feeds - search note feeds by keyword
     p_search = sub.add_parser(
@@ -3199,6 +4113,34 @@ def main():
     )
     p_detail.add_argument("--feed-id", required=True, help="Feed id")
     p_detail.add_argument("--xsec-token", required=True, help="xsec token")
+    p_detail.add_argument(
+        "--load-all-comments",
+        action="store_true",
+        help="Scroll to load more top-level comments before extracting detail",
+    )
+    p_detail.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Target max number of top-level comments to load (default: 20)",
+    )
+    p_detail.add_argument(
+        "--click-more-replies",
+        action="store_true",
+        help="Try to expand visible reply groups while loading comments",
+    )
+    p_detail.add_argument(
+        "--reply-limit",
+        type=int,
+        default=10,
+        help="Skip expanding reply groups above this size when possible (default: 10)",
+    )
+    p_detail.add_argument(
+        "--scroll-speed",
+        choices=("slow", "normal", "fast"),
+        default="normal",
+        help="Comment loading scroll speed (default: normal)",
+    )
 
     # post-comment-to-feed - post top-level comment to feed detail
     p_comment = sub.add_parser(
@@ -3454,6 +4396,12 @@ def main():
                 )
             sys.exit(0 if logged_in else 1)
 
+        elif args.command in ("get-login-qrcode", "get_login_qrcode"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            payload = publisher.get_login_qrcode(wait_seconds=args.wait_seconds)
+            print("GET_LOGIN_QRCODE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
         elif args.command in ("fill", "publish"):
             content = args.content
             if args.content_file:
@@ -3486,6 +4434,16 @@ def main():
             publisher._click_publish()
             print("PUBLISH_STATUS: PUBLISHED")
 
+        elif args.command in ("list-feeds", "list_feeds"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+
+            payload = publisher.list_feeds()
+            print("LIST_FEEDS_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
         elif args.command in ("search-feeds", "search_feeds"):
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             if not publisher.check_home_login():
@@ -3512,14 +4470,21 @@ def main():
                 print("NOT_LOGGED_IN")
                 sys.exit(1)
 
-            detail = publisher.get_feed_detail(
+            detail_result = publisher.get_feed_detail(
                 feed_id=args.feed_id,
                 xsec_token=args.xsec_token,
+                load_all_comments=args.load_all_comments,
+                limit=args.limit,
+                click_more_replies=args.click_more_replies,
+                reply_limit=args.reply_limit,
+                scroll_speed=args.scroll_speed,
             )
             payload = {
                 "feed_id": args.feed_id,
                 "xsec_token": args.xsec_token,
-                "detail": detail,
+                "load_all_comments": args.load_all_comments,
+                "comment_loading": detail_result.get("comment_loading"),
+                "detail": detail_result.get("detail"),
             }
             print("GET_FEED_DETAIL_RESULT:")
             print(json.dumps(payload, ensure_ascii=False, indent=2))

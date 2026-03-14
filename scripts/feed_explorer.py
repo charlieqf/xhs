@@ -192,6 +192,28 @@ class FeedExplorer:
                 "Timed out waiting for feed detail in window.__INITIAL_STATE__."
             )
 
+
+    def _wait_for_home_feeds_state(self):
+        """Wait until home feed data is available in __INITIAL_STATE__."""
+        ready = self._wait_js_condition(
+            """
+            (() => {
+                const state = window.__INITIAL_STATE__;
+                return !!(
+                    state &&
+                    state.feed &&
+                    state.feed.feeds
+                );
+            })()
+            """,
+            timeout_seconds=25.0,
+            poll_seconds=0.6,
+        )
+        if not ready:
+            raise FeedExplorerError(
+                "Timed out waiting for home feeds in window.__INITIAL_STATE__."
+            )
+
     def _find_filter_button_rect(self) -> dict[str, float] | None:
         """Return visible filter button rect."""
         rect = self._evaluate(
@@ -596,6 +618,43 @@ class FeedExplorer:
             raise FeedExplorerError("Search feed payload is not a list.")
         return parsed
 
+
+    def _extract_home_feeds(self) -> list[dict[str, Any]]:
+        """Extract home feed array from home initial state."""
+        raw = self._evaluate(
+            """
+            (() => {
+                if (
+                    window.__INITIAL_STATE__ &&
+                    window.__INITIAL_STATE__.feed &&
+                    window.__INITIAL_STATE__.feed.feeds
+                ) {
+                    const feeds = window.__INITIAL_STATE__.feed.feeds;
+                    const data = feeds.value !== undefined ? feeds.value : feeds._value;
+                    if (data) {
+                        return JSON.stringify(data);
+                    }
+                }
+                return "";
+            })()
+            """
+        )
+
+        if not raw:
+            return []
+
+        if not isinstance(raw, str):
+            raise FeedExplorerError("Home feed payload is not a JSON string.")
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise FeedExplorerError(f"Failed to parse home feed JSON: {exc}") from exc
+
+        if not isinstance(parsed, list):
+            raise FeedExplorerError("Home feed payload is not a list.")
+        return parsed
+
     def _extract_feed_detail(self, feed_id: str) -> dict[str, Any]:
         """Extract one feed detail object from noteDetailMap."""
         feed_literal = json.dumps(feed_id)
@@ -675,6 +734,22 @@ class FeedExplorer:
         while time.time() < deadline:
             self._sleep(0.6, minimum_seconds=0.2)
             feeds = self._extract_search_feeds()
+            if feeds:
+                return feeds
+        return feeds
+
+    def list_feeds(self) -> list[dict[str, Any]]:
+        """Extract feed list from the current home page."""
+        self._wait_for_home_feeds_state()
+
+        feeds = self._extract_home_feeds()
+        if feeds:
+            return feeds
+
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            self._sleep(0.6, minimum_seconds=0.2)
+            feeds = self._extract_home_feeds()
             if feeds:
                 return feeds
         return feeds
