@@ -75,6 +75,7 @@ if sys.platform == "win32":
 
 import requests
 import websockets.sync.client as ws_client
+from websockets.exceptions import ConnectionClosedError
 from feed_explorer import (
     SEARCH_BASE_URL,
     LOCATION_OPTIONS,
@@ -571,9 +572,42 @@ class XiaohongshuPublisher:
         if not ws_url:
             raise CDPError("Could not obtain WebSocket URL for any tab.")
 
+        self._ws_url = ws_url
+        self._connect_ws(ws_url)
+
+    def _connect_ws(self, ws_url: str):
+        """Establish the raw WebSocket connection with keepalive disabled."""
         print(f"[cdp_publish] Connecting to {ws_url}")
-        self.ws = ws_client.connect(ws_url)
+        # Disable keepalive pings: CDP is a local connection and the
+        # default 20s ping_interval/ping_timeout causes spurious
+        # disconnects when the main thread is blocked by long operations
+        # (e.g. LLM API calls, network delays, or anti-detect sleeps).
+        self.ws = ws_client.connect(ws_url, ping_interval=None)
         print("[cdp_publish] Connected to Chrome tab.")
+
+    def _ensure_connected(self):
+        """Reconnect if the WebSocket has been closed unexpectedly."""
+        if self.ws is not None:
+            try:
+                # A lightweight way to check: pong will come back if alive.
+                self.ws.ping()
+                return
+            except Exception:
+                pass
+
+        ws_url = getattr(self, "_ws_url", None)
+        if not ws_url:
+            raise CDPError("Not connected and no saved ws_url for reconnection.")
+
+        print("[cdp_publish] WebSocket disconnected, reconnecting...")
+        try:
+            self._connect_ws(ws_url)
+        except Exception:
+            # ws_url may have gone stale (tab closed), try to get a fresh one
+            print("[cdp_publish] Stale ws_url, re-discovering target tab...")
+            ws_url = self._find_or_create_tab(reuse_existing_tab=True)
+            self._ws_url = ws_url
+            self._connect_ws(ws_url)
 
     def disconnect(self):
         """Close the WebSocket connection."""
@@ -591,9 +625,23 @@ class XiaohongshuPublisher:
         params: dict | None = None,
         timeout_seconds: float | None = None,
     ) -> dict:
-        """Send a CDP command and return the result with a bounded wait."""
-        if not self.ws:
-            raise CDPError("Not connected. Call connect() first.")
+        """Send a CDP command and return the result with a bounded wait.
+
+        Automatically reconnects once if the WebSocket was closed (e.g. by
+        a previous keepalive timeout or network hiccup).
+        """
+        return self._send_inner(method, params, timeout_seconds, _retried=False)
+
+    def _send_inner(
+        self,
+        method: str,
+        params: dict | None = None,
+        timeout_seconds: float | None = None,
+        *,
+        _retried: bool = False,
+    ) -> dict:
+        """Internal send with one-shot reconnect on ConnectionClosedError."""
+        self._ensure_connected()
 
         self._msg_id += 1
         message_id = self._msg_id
@@ -601,7 +649,14 @@ class XiaohongshuPublisher:
         if params:
             msg["params"] = params
 
-        self.ws.send(json.dumps(msg))
+        try:
+            self.ws.send(json.dumps(msg))
+        except ConnectionClosedError:
+            if _retried:
+                raise CDPError(f"WebSocket closed while sending {method} (after reconnect).")
+            self.ws = None
+            return self._send_inner(method, params, timeout_seconds, _retried=True)
+
         timeout = float(timeout_seconds or self.command_timeout_seconds)
         deadline = time.monotonic() + max(0.1, timeout)
 
@@ -616,6 +671,11 @@ class XiaohongshuPublisher:
 
             try:
                 raw = self.ws.recv(timeout=max(0.1, remaining))
+            except ConnectionClosedError:
+                if _retried:
+                    raise CDPError(f"WebSocket closed while waiting for {method} (after reconnect).")
+                self.ws = None
+                return self._send_inner(method, params, timeout_seconds, _retried=True)
             except TimeoutError as exc:
                 raise CDPError(
                     f"Timed out waiting for CDP response to {method} "
@@ -1153,22 +1213,33 @@ class XiaohongshuPublisher:
             qrcode_data_url = f"data:{mime_type};base64,{image_base64}"
 
         return {
-            "logged_in": False,
-            "current_url": current_url,
-            "qrcode_base64": image_base64,
-            "qrcode_data_url": qrcode_data_url,
             "mime_type": mime_type,
             "selector": qrcode_meta.get("selector", ""),
             "tag_name": qrcode_meta.get("tag_name", ""),
             "hint_text": qrcode_meta.get("hint_text", ""),
         }
 
-    # ------------------------------------------------------------------
-    # Feed discovery actions
-    # ------------------------------------------------------------------
+    def _detect_rate_limit_page(self) -> bool:
+        """Check if the current page is a rate-limit / security block page."""
+        detected = self._evaluate("""
+            (() => {
+                const text = (document.body && document.body.innerText) || '';
+                if (text.includes('安全限制') || text.includes('访问频繁')
+                    || text.includes('请求太频繁') || text.includes('300013')) {
+                    return true;
+                }
+                return false;
+            })()
+        """)
+        return bool(detected)
 
-    def _prepare_search_input_keyword(self, keyword: str) -> dict[str, Any]:
-        """Focus search input and type keyword without submitting."""
+    def _submit_search_via_input(self, keyword: str) -> bool:
+        """Type keyword into the search box and press Enter to search.
+
+        Returns True if the search input was found and submitted.
+        This simulates human search behavior and avoids anti-bot detection
+        that triggers on direct URL navigation to search result pages.
+        """
         keyword_literal = json.dumps(keyword, ensure_ascii=False)
         result = self._evaluate(f"""
             (async () => {{
@@ -1176,12 +1247,8 @@ class XiaohongshuPublisher:
                 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
                 const isVisible = (node) => {{
-                    if (!(node instanceof HTMLElement)) {{
-                        return false;
-                    }}
-                    if (node.offsetParent === null) {{
-                        return false;
-                    }}
+                    if (!(node instanceof HTMLElement)) return false;
+                    if (node.offsetParent === null) return false;
                     const rect = node.getBoundingClientRect();
                     return rect.width >= 8 && rect.height >= 8;
                 }};
@@ -1198,24 +1265,19 @@ class XiaohongshuPublisher:
                 for (const selector of selectors) {{
                     const nodes = document.querySelectorAll(selector);
                     for (const node of nodes) {{
-                        if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) {{
-                            continue;
-                        }}
-                        if (node.disabled || !isVisible(node)) {{
-                            continue;
-                        }}
+                        if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) continue;
+                        if (node.disabled || !isVisible(node)) continue;
                         inputEl = node;
                         break;
                     }}
-                    if (inputEl) {{
-                        break;
-                    }}
+                    if (inputEl) break;
                 }}
 
                 if (!inputEl) {{
                     return {{ ok: false, reason: "search_input_not_found" }};
                 }}
 
+                // Set value using React-compatible setter
                 const setValue = (value) => {{
                     const proto = inputEl instanceof HTMLTextAreaElement
                         ? HTMLTextAreaElement.prototype
@@ -1230,11 +1292,13 @@ class XiaohongshuPublisher:
                     inputEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
                 }};
 
+                // Focus and clear
                 inputEl.focus();
-                await sleep(120);
+                await sleep(100 + Math.floor(Math.random() * 100));
                 setValue("");
-                await sleep(80);
+                await sleep(60 + Math.floor(Math.random() * 60));
 
+                // Type character by character (human-like)
                 let typed = "";
                 for (const ch of Array.from(keyword)) {{
                     typed += ch;
@@ -1455,8 +1519,12 @@ class XiaohongshuPublisher:
         if not keyword:
             raise CDPError("Keyword cannot be empty.")
 
-        self._navigate(SEARCH_BASE_URL)
-        self._sleep(2, minimum_seconds=1.0)
+        # Navigate directly to the keyword search URL to avoid a double
+        # page load (the old flow navigated to SEARCH_BASE_URL first, then
+        # again with keyword — triggering "请求太频繁" rate limits).
+        search_url = make_search_url(keyword)
+        self._navigate(search_url)
+        self._sleep(2, minimum_seconds=1.5)
 
         explorer = FeedExplorer(
             self._evaluate,
@@ -1465,20 +1533,24 @@ class XiaohongshuPublisher:
             click_mouse=self._click_mouse,
         )
 
-        recommendation_result = self._capture_search_recommendations_via_network(keyword=keyword)
-        recommended_keywords = recommendation_result.get("suggestions", [])
-
-        if not recommendation_result.get("ok"):
-            reason = recommendation_result.get("reason") or "recommend_api_failed"
-            print(
-                "[cdp_publish] Warning: failed to capture search recommendations via API. "
-                f"reason={reason}"
+        # Try to capture search recommendations from the current page.
+        # This only works if the search input is present (it should be
+        # since we already loaded the search results page).
+        recommended_keywords: list[str] = []
+        try:
+            recommendation_result = self._capture_search_recommendations_via_network(
+                keyword=keyword, wait_seconds=3.0,
             )
-
-        # Always navigate with keyword URL to keep feed extraction stable.
-        search_url = make_search_url(keyword)
-        self._navigate(search_url)
-        self._sleep(2, minimum_seconds=1.0)
+            recommended_keywords = recommendation_result.get("suggestions", [])
+            if not recommendation_result.get("ok"):
+                # Non-critical — just log and continue
+                reason = recommendation_result.get("reason") or "recommend_api_failed"
+                print(
+                    "[cdp_publish] Warning: search recommendations unavailable. "
+                    f"reason={reason}"
+                )
+        except Exception:
+            pass
 
         try:
             feeds = explorer.search_feeds(keyword=keyword, filters=filters)
@@ -1886,6 +1958,7 @@ class XiaohongshuPublisher:
         click_more_replies: bool = False,
         reply_limit: int = 10,
         scroll_speed: str = "normal",
+        navigate_via_dom: bool = False,
     ) -> dict[str, Any]:
         """
         Get feed detail from note page initial state.
@@ -1902,9 +1975,29 @@ class XiaohongshuPublisher:
         if not xsec_token:
             raise CDPError("xsec_token cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
-        self._navigate(detail_url)
-        self._sleep(2, minimum_seconds=1.0)
+        if navigate_via_dom:
+            clicked = self._evaluate(f"""
+                (() => {{
+                    const feedId = "{feed_id}";
+                    const links = Array.from(document.querySelectorAll('a[href*="' + feedId + '"]'));
+                    const validLink = links.find(link => link.closest('.note-item') || link.href.includes('explore'));
+                    if (validLink) {{
+                        validLink.removeAttribute('target');
+                        validLink.click();
+                        return true;
+                    }}
+                    return false;
+                }})()
+            """)
+            if not clicked:
+                detail_url = make_feed_detail_url(feed_id, xsec_token)
+                self._navigate(detail_url)
+            self._sleep(2.5, minimum_seconds=1.0)
+        else:
+            detail_url = make_feed_detail_url(feed_id, xsec_token)
+            self._navigate(detail_url)
+            self._sleep(2, minimum_seconds=1.0)
+            
         self._check_feed_page_accessible()
 
         comment_loading = None
@@ -2250,9 +2343,10 @@ class XiaohongshuPublisher:
                         "id",
                     ];
                     for (const key of attrs) {
-                        const value = node.getAttribute(key);
-                        if (value && normalize(value)) {
-                            return normalize(value);
+                        let value = node.getAttribute(key);
+                        if (value) {
+                            value = normalize(value).replace(/^comment-/, "");
+                            if (value) return value;
                         }
                     }
                     if (node.dataset) {
@@ -2261,15 +2355,20 @@ class XiaohongshuPublisher:
                             node.dataset.id,
                             node.dataset.commentid,
                         ];
-                        for (const value of values) {
-                            if (value && normalize(value)) {
-                                return normalize(value);
+                        for (let value of values) {
+                            if (value) {
+                                value = normalize(value).replace(/^comment-/, "");
+                                if (value) return value;
                             }
                         }
                     }
                     return "";
                 };
                 const findReplyControl = (container) => {
+                    const replyDiv = container.querySelector(".reply.icon-container, .reply");
+                    if (replyDiv && visible(replyDiv)) {
+                        return replyDiv;
+                    }
                     const selectors = [
                         "button",
                         "[role='button']",
@@ -2394,6 +2493,7 @@ class XiaohongshuPublisher:
         comment_id: str | None = None,
         comment_author: str | None = None,
         comment_snippet: str | None = None,
+        skip_navigation: bool = False,
     ) -> dict[str, Any]:
         """Reply to an existing comment on a feed detail page."""
         if not self.ws:
@@ -2409,10 +2509,13 @@ class XiaohongshuPublisher:
         if not content:
             raise CDPError("content cannot be empty.")
 
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
-        self._navigate(detail_url)
-        self._sleep(2, minimum_seconds=1.0)
-        self._check_feed_page_accessible()
+        if not skip_navigation:
+            current_url = str(self._evaluate("window.location.href") or "")
+            if feed_id not in current_url:
+                detail_url = make_feed_detail_url(feed_id, xsec_token)
+                self._navigate(detail_url)
+                self._sleep(2, minimum_seconds=1.0)
+                self._check_feed_page_accessible()
 
         target_result = self._activate_reply_target_for_comment(
             comment_id=comment_id,
@@ -3439,6 +3542,14 @@ class XiaohongshuPublisher:
                     fuzzyKeywords.push('视频', '上传视频');
                 }}
 
+                function isVisible(el) {{
+                    if (!el || el.offsetParent === null) return false;
+                    var style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    var rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && rect.left > -1000 && rect.top > -1000;
+                }}
+
                 function matches(text) {{
                     var t = (text || '').trim();
                     if (!t) return false;
@@ -3454,7 +3565,7 @@ class XiaohongshuPublisher:
 
                 var tabs = document.querySelectorAll('{tab_selector}');
                 for (var i = 0; i < tabs.length; i++) {{
-                    if (matches(tabs[i].textContent)) {{
+                    if (isVisible(tabs[i]) && matches(tabs[i].textContent)) {{
                         tabs[i].click();
                         return true;
                     }}
@@ -3462,7 +3573,7 @@ class XiaohongshuPublisher:
 
                 var allTabs = document.querySelectorAll({selector_alt_literal});
                 for (var j = 0; j < allTabs.length; j++) {{
-                    if (matches(allTabs[j].textContent)) {{
+                    if (isVisible(allTabs[j]) && matches(allTabs[j].textContent)) {{
                         allTabs[j].click();
                         return true;
                     }}

@@ -1,0 +1,13 @@
+{
+    "keywords_count": 1,
+    "city_count": 1,
+    "platform_count": 1,
+    "sports_count": 1,
+    "min_comment_count": 5,
+    "analyze_comment_count": 10,
+    "post_per_keyword": 10,
+    "keyword_delay_min": 3,
+    "keyword_delay_max": 8,
+    "post_delay_min": 2,
+    "post_delay_max": 5
+}

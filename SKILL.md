@@ -68,6 +68,51 @@ metadata:
 10. 若用户需要“笔记基础信息表”，执行 `content-data` 获取曝光/观看/点赞等指标。
 11. 回传结构化结果（数量、核心字段、链接）。
 
+## 评论截流机器人（自动回复）
+
+用户要求"评论截流 / 自动回复评论 / 跑评论机器人"时进入此流程。
+
+脚本位置：`prod/comment_bot.py`
+配置文件：`prod/config.json` + `prod/keywords.json`
+
+### 工作原理
+
+1. 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
+2. 遍历关键词搜索小红书笔记。
+3. 对每篇笔记提取 DOM 评论，送 LLM（OpenRouter Gemini）分析相亲意向。
+4. 有意向时自动回复该评论（≤50字），无意向则跳过。
+5. 缓存机制避免重复回复，结果保存在 `prod/` 目录。
+
+### 运行命令
+
+```bash
+# 确保 Chrome 已启动并登录
+python scripts/chrome_launcher.py --restart
+python scripts/cdp_publish.py check-login
+
+# 运行评论机器人
+python prod/comment_bot.py
+```
+
+### 配置说明（prod/config.json）
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `keywords_count` | 从 general_keywords 随机取的数量 | 10 |
+| `city_count` | 每个含 `{city}` 模板展开的城市数 | 3 |
+| `platform_count` | 每个含 `{platform}` 模板展开的平台数 | 3 |
+| `sports_count` | 每个含 `{sports}` 模板展开的运动数 | 3 |
+| `min_comment_count` | 评论数低于此值的笔记跳过 | 5 |
+| `analyze_comment_count` | 取前 N 条评论送 LLM 分析 | 10 |
+| `post_per_keyword` | 每个关键词处理的笔记数 | 10 |
+| `keyword_delay_min/max` | 关键词间随机延迟（秒） | 3~8 |
+| `post_delay_min/max` | 笔记间随机延迟（秒） | 2~5 |
+
+### 输出文件
+
+- `prod/comment_responses.json`：回复记录
+- `prod/processed_cache.json`：已处理缓存（避免重复）
+
 ## 常用命令
 
 ### 参数顺序提醒（`cdp_publish.py` / `publish_pipeline.py`）

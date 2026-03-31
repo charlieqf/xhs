@@ -24,6 +24,7 @@
 - **用户页信息提取**：支持抓取用户主页快照与主页笔记列表
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
 - **内容数据看板抓取**：支持抓取“笔记基础信息”表（曝光/观看/点赞等）并导出 CSV
+- **评论截流机器人**：基于关键词搜索笔记，LLM 分析评论意向，自动回复最有相亲服务需求的评论（支持 city/platform/sports 关键词展开、缓存去重、反检测延迟）
 
 ## 安装
 
@@ -370,6 +371,25 @@ python scripts/chrome_launcher.py --kill
 - WB_PRV：预览图（preview），通常更轻、更快，适合列表卡片。
   - WB_DFT：默认图（default），通常用于详情展示，质量/尺寸更完整。
 
+### 7. 评论截流机器人
+
+基于关键词自动搜索笔记并回复有相亲意向的评论。
+
+```bash
+# 确保 Chrome 已启动并登录
+python scripts/chrome_launcher.py --restart
+python scripts/cdp_publish.py check-login
+
+# 运行评论机器人
+python prod/comment_bot.py
+```
+
+配置文件：`prod/config.json`（关键词数量、评论门槛、延迟等）+ `prod/keywords.json`（关键词模板与城市/平台/运动列表）。
+
+输出：
+- `prod/comment_responses.json`：回复记录
+- `prod/processed_cache.json`：已处理缓存
+
 ## RoadMap
 - [x] 支持更多账号管理功能
 - [x] 支持发布功能
@@ -377,6 +397,7 @@ python scripts/chrome_launcher.py --kill
 - [x] 支持自动评论
 - [x] 支持素材检索功能
 - [x] 增加更多错误处理机制
+- [x] 评论截流机器人（关键词展开 + LLM 意向分析 + 自动回复）
 
 
 ## 许可证
