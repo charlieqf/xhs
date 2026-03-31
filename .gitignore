@@ -52,3 +52,4 @@ images/publish_temp/*
 # OS
 .DS_Store
 Thumbs.db
+*.zip
