@@ -128,51 +128,161 @@ def save_cache(cache: dict):
 #  DOM 交互辅助函数（纯 SPA 内操作，不做任何 URL 硬跳转）
 # ============================================================
 
-def click_note_card(publisher, feed_id: str) -> bool:
+def _scroll_search_page(publisher, pixels: int = 600):
+    """在搜索结果页向下滚动指定像素，触发懒加载。"""
+    publisher._evaluate(f"window.scrollBy(0, {pixels});")
+    publisher._sleep(1.2, minimum_seconds=0.8)
+
+
+def _find_card_in_dom(publisher, feed_id: str) -> bool:
     """
-    在搜索结果页中，通过真实 CDP 鼠标点击指定 feed_id 的笔记卡片封面。
-    先滚动到可视区域，再用 Input.dispatchMouseEvent 模拟真实点击。
+    检查 feed_id 对应的**可点击卡片**是否存在于当前 DOM 中。
+    只匹配真正可点击的元素，避免 textContent 误匹配隐藏 JSON 等。
     """
-    # Step 1: 尝试将目标卡片滚动到可视区域
+    return bool(publisher._evaluate(f"""
+        (() => {{
+            const feedId = "{feed_id}";
+            // 1. 检查 <a> 标签 href 包含 feedId（最可靠）
+            const links = document.querySelectorAll('a[href*="' + feedId + '"]');
+            for (const link of links) {{
+                const rect = link.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return true;
+            }}
+            // 2. 检查带 data 属性的元素
+            const dataEls = document.querySelectorAll(
+                '[data-note-id="' + feedId + '"], ' +
+                '[data-feed-id="' + feedId + '"], ' +
+                '[note-id="' + feedId + '"], ' +
+                '[feed-id="' + feedId + '"]'
+            );
+            for (const el of dataEls) {{
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return true;
+            }}
+            return false;
+        }})()
+    """))
+
+
+def click_note_card(publisher, feed_id: str, feed_index: int = 0) -> bool:
+    """
+    在搜索结果页中，通过 CDP 鼠标点击指定 feed_id 的笔记卡片封面。
+    增强版：预滚动 + 多轮滚动查找 + 多种 DOM 选择器 + 点击重试。
+
+    Args:
+        feed_index: 当前笔记在列表中的序号（0-based），用于估算预滚动距离。
+    """
+    # 阶段 0：如果卡片不在 DOM 中，根据序号预滚动到大致位置
+    if not _find_card_in_dom(publisher, feed_id) and feed_index > 0:
+        estimated_y = (feed_index // 2) * 280
+        publisher._evaluate(
+            f"window.scrollTo({{ top: {estimated_y}, behavior: 'instant' }});"
+        )
+        publisher._sleep(1.5, minimum_seconds=0.8)
+
+    # 阶段 1：如果卡片仍不在 DOM 中，逐步向下滚动触发懒加载
+    max_scroll_attempts = 10
+    if not _find_card_in_dom(publisher, feed_id):
+        for attempt in range(max_scroll_attempts):
+            _scroll_search_page(publisher, pixels=500)
+            if _find_card_in_dom(publisher, feed_id):
+                break
+        else:
+            # 向下搜索失败，滚回顶部做一次全量向下搜索
+            publisher._evaluate("window.scrollTo({ top: 0, behavior: 'instant' });")
+            publisher._sleep(1.5, minimum_seconds=0.8)
+            for attempt in range(max_scroll_attempts):
+                if _find_card_in_dom(publisher, feed_id):
+                    break
+                _scroll_search_page(publisher, pixels=500)
+            else:
+                return False
+
+    # 阶段 2：滚动到卡片可视区域（使用 instant 避免动画延迟）
     scroll_ok = publisher._evaluate(f"""
         (() => {{
             const feedId = "{feed_id}";
-            const links = document.querySelectorAll('a');
+            // 优先通过 href 精确匹配 <a> 标签
+            const links = document.querySelectorAll('a[href*="' + feedId + '"]');
             for (const link of links) {{
-                if (link.href && link.href.includes(feedId)) {{
-                    link.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
-                    return true;
-                }}
+                link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                return true;
+            }}
+            // fallback: data 属性匹配
+            const dataEls = document.querySelectorAll(
+                '[data-note-id="' + feedId + '"], ' +
+                '[data-feed-id="' + feedId + '"]'
+            );
+            for (const el of dataEls) {{
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                return true;
             }}
             return false;
         }})()
     """)
     if not scroll_ok:
         return False
-    publisher._sleep(0.8, minimum_seconds=0.3)
+    publisher._sleep(1.5, minimum_seconds=0.8)
 
-    # Step 2: 获取卡片封面区域的 rect，交给 CDP 鼠标事件点击
-    rect_js = f"""
-        (() => {{
-            const feedId = "{feed_id}";
-            const links = document.querySelectorAll('a');
-            for (const link of links) {{
-                if (!link.href || !link.href.includes(feedId)) continue;
-                const rect = link.getBoundingClientRect();
-                if (rect.width > 30 && rect.height > 30 &&
-                    rect.top >= 0 && rect.bottom <= window.innerHeight + 50) {{
-                    return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+    # 阶段 3：获取卡片矩形并点击（带重试）
+    for retry in range(3):
+        rect_js = f"""
+            (() => {{
+                const feedId = "{feed_id}";
+                
+                // 优先检查 <a> 标签
+                const links = document.querySelectorAll('a');
+                for (const link of links) {{
+                    if (!link.href || !link.href.includes(feedId)) continue;
+                    const rect = link.getBoundingClientRect();
+                    if (rect.width > 20 && rect.height > 20 &&
+                        rect.bottom > 0 && rect.top < window.innerHeight) {{
+                        return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                    }}
                 }}
-            }}
-            return null;
-        }})()
-    """
-    try:
-        publisher._click_element_by_cdp("note card cover", rect_js)
-        return True
-    except Exception as e:
-        print(f"  -> [调试] CDP 点击卡片失败: {e}")
-        return False
+                
+                // fallback: 检查 data-* 属性
+                const dataEls = document.querySelectorAll(
+                    '[data-note-id="' + feedId + '"], ' +
+                    '[data-feed-id="' + feedId + '"], ' +
+                    '[note-id="' + feedId + '"], ' +
+                    '[feed-id="' + feedId + '"]'
+                );
+                for (const el of dataEls) {{
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 20 && rect.height > 20 &&
+                        rect.bottom > 0 && rect.top < window.innerHeight) {{
+                        return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                    }}
+                }}
+                
+                return null;
+            }})()
+        """
+        try:
+            publisher._click_element_by_cdp("note card cover", rect_js)
+            return True
+        except Exception as e:
+            if retry < 2:
+                print(f"  -> [调试] CDP 点击卡片失败（重试 {retry + 1}/2）: {e}")
+                publisher._sleep(1.0, minimum_seconds=0.5)
+                publisher._evaluate(f"""
+                    (() => {{
+                        const feedId = "{feed_id}";
+                        const links = document.querySelectorAll('a');
+                        for (const link of links) {{
+                            if (link.href && link.href.includes(feedId)) {{
+                                link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                                return true;
+                            }}
+                        }}
+                        return false;
+                    }})()
+                """)
+                publisher._sleep(1.0, minimum_seconds=0.5)
+            else:
+                print(f"  -> [调试] CDP 点击卡片失败: {e}")
+                return False
 
 
 def wait_for_detail_state(publisher, feed_id: str, timeout: float = 10.0) -> bool:
@@ -337,8 +447,9 @@ def main():
             # ======== 核心：纯 DOM 点击 + 浮层提取 ========
 
             # 1. 在搜索结果页，通过 CDP 鼠标事件点击笔记卡片封面
-            if not click_note_card(publisher, feed_id):
-                print("  -> [跳过] 在搜索结果页未找到该笔记卡片（可能已被懒加载移除）。")
+            if not click_note_card(publisher, feed_id, feed_index=idx - 1):
+                print("  -> [跳过] 笔记卡片点击失败。执行向下翻页恢复页面状态...")
+                _scroll_search_page(publisher, pixels=800)
                 continue
 
             # 2. 等待 SPA 路由加载笔记详情数据

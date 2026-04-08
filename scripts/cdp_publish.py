@@ -1539,7 +1539,7 @@ class XiaohongshuPublisher:
         recommended_keywords: list[str] = []
         try:
             recommendation_result = self._capture_search_recommendations_via_network(
-                keyword=keyword, wait_seconds=3.0,
+                keyword=keyword, wait_seconds=10.0,
             )
             recommended_keywords = recommendation_result.get("suggestions", [])
             if not recommendation_result.get("ok"):

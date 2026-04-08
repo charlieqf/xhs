@@ -992,5 +992,578 @@
     "comment_id": "68f794810000000039009d2e",
     "status": "success",
     "processed_at": "2026-03-31 10:32:11"
+  },
+  "67b95803000000002902b33d": {
+    "title": "82年，43岁，已经没人联系我了",
+    "target_user": "泗泾城中的大向｜别墅",
+    "comment_id": "67bb0fe4000000001c00be1e",
+    "status": "success",
+    "processed_at": "2026-04-02 16:13:55"
+  },
+  "68c56984000000001d018827": {
+    "title": "34岁大龄女生再找不到对象爸妈就让滚回老家",
+    "target_user": "轻轻路过36",
+    "comment_id": "68c742dc000000003002eb9e",
+    "status": "success",
+    "processed_at": "2026-04-02 16:14:27"
+  },
+  "69cba33b000000001a02c29c": {
+    "title": "未命名笔记",
+    "target_user": "云间拾梦",
+    "comment_id": "69cc68e80000000001004e26",
+    "status": "success",
+    "processed_at": "2026-04-02 16:14:44"
+  },
+  "6995956500000000090380fe": {
+    "title": "在潮汕，32岁，真的被催麻了",
+    "target_user": "momo",
+    "comment_id": "69ca5add000000000202982f",
+    "status": "success",
+    "processed_at": "2026-04-02 16:15:02"
+  },
+  "690364090000000003011cfb": {
+    "title": "你以为的大龄剩女vs实际上的大龄剩女",
+    "target_user": "点点",
+    "comment_id": "69bbf54400000000030115de",
+    "status": "success",
+    "processed_at": "2026-04-02 16:15:19"
+  },
+  "69bb2800000000001a03487a": {
+    "title": "86年未婚未育，放过自己了",
+    "target_user": "心如旷野",
+    "comment_id": "69ccc98d0000000015009941",
+    "status": "success",
+    "processed_at": "2026-04-02 16:15:38"
+  },
+  "68ada5a4000000001d01b9ec": {
+    "title": "88年36岁 未婚未育 已经没有人找了",
+    "target_user": "诸天",
+    "comment_id": "68ae539f0000000002001578",
+    "status": "success",
+    "processed_at": "2026-04-02 16:15:56"
+  },
+  "69cb4ffd000000002103b808": {
+    "title": "浙江大龄单身女找对象！",
+    "target_user": "不讲李",
+    "comment_id": "69cceaec000000000d03e530",
+    "status": "success",
+    "processed_at": "2026-04-02 16:16:14"
+  },
+  "69a59a130000000023039b44": {
+    "title": "未命名笔记",
+    "target_user": "解夏",
+    "comment_id": "69ccc67e0000000002034dd4",
+    "status": "success",
+    "processed_at": "2026-04-02 16:16:38"
+  },
+  "692c1874000000001e015bd6": {
+    "title": "香港本地的婚介公司长啥样？",
+    "target_user": "IFBB锤",
+    "comment_id": "6937c9a300000000310320df",
+    "status": "success",
+    "processed_at": "2026-04-02 16:17:07"
+  },
+  "69860464000000000b010cf0": {
+    "title": "晋江陈埭锦缘网靠谱吗",
+    "target_user": "FuFu",
+    "comment_id": "69a259e3000000001403320b",
+    "status": "success",
+    "processed_at": "2026-04-02 16:17:50"
+  },
+  "6981c3bd000000001a032301": {
+    "title": "",
+    "target_user": "小k",
+    "comment_id": "698718b200000000110199e0",
+    "status": "success",
+    "processed_at": "2026-04-02 16:30:53"
+  },
+  "62fb0aa7000000000f014161": {
+    "title": "未命名笔记",
+    "status": "no_intent",
+    "reason": "所有评论均在讨论充值记录查询、消费金额及平台功能，属于技术与支出讨论，未表现出脱单或交友的个人需求意向。",
+    "processed_at": "2026-04-02 16:31:05"
+  },
+  "6759aec4000000000700c954": {
+    "title": "Soul虚假宣传误导消费，要求退款解除会员！",
+    "status": "no_intent",
+    "reason": "所有评论均围绕Soul等软件的退款纠纷、霸王条款以及维权投诉展开，用户表现出的是强烈的维权和排斥心理，而非交友意向。",
+    "processed_at": "2026-04-02 16:31:17"
+  },
+  "69a66afb0000000015032383": {
+    "title": "未命名笔记",
+    "status": "no_intent",
+    "reason": "所有评论均在讨论账号买卖（如收号、出号、账号天数等），并非寻找对象或寻求脱单服务，不符合相亲交友意向判断标准。",
+    "processed_at": "2026-04-02 16:31:34"
+  },
+  "692e5b2f000000001e0080e7": {
+    "title": "未命名笔记",
+    "target_user": "小时不识月。",
+    "comment_id": "692e60de000000000e0357b2",
+    "status": "success",
+    "processed_at": "2026-04-02 16:31:52"
+  },
+  "67f17f4d000000001e009f93": {
+    "title": "这个soul真的能找到女朋友吗？",
+    "target_user": "小矮人",
+    "comment_id": "6811cef7000000001200b518",
+    "status": "success",
+    "processed_at": "2026-04-02 16:32:09"
+  },
+  "67271d89000000001b02c578": {
+    "title": "花5k充社交app会员！手把手教你找到真爱",
+    "target_user": "崔了☝个🐄",
+    "comment_id": "679bbb2a000000000a0374b9",
+    "status": "success",
+    "processed_at": "2026-04-02 16:32:31"
+  },
+  "69b14be7000000002203219e": {
+    "title": "未命名笔记",
+    "status": "no_intent",
+    "reason": "所有评论均在讨论职场纠纷、试用期工资及仲裁维权相关话题，未发现任何涉及交友、相亲或脱单意向的言论。",
+    "processed_at": "2026-04-02 16:37:14"
+  },
+  "6930fb75000000001e0240f7": {
+    "title": "真诚积极相亲！中介勿扰",
+    "target_user": "聆屿",
+    "comment_id": "69a6743b000000000503bed2",
+    "status": "success",
+    "processed_at": "2026-04-02 16:37:27"
+  },
+  "694253da000000001e0341d3": {
+    "title": "未命名笔记",
+    "target_user": "阿奇",
+    "comment_id": "69539a2d000000000f00e700",
+    "status": "success",
+    "processed_at": "2026-04-02 16:37:43"
+  },
+  "68f8e3360000000003010211": {
+    "title": "寻找自己另一半 女找男（广元)",
+    "target_user": "大宋帝国",
+    "comment_id": "69b61ac000000000150152a6",
+    "status": "success",
+    "processed_at": "2026-04-02 16:38:00"
+  },
+  "6859c8b200000000100259ef": {
+    "title": "99年舞蹈老师接受姐弟恋",
+    "target_user": "不为人",
+    "comment_id": "69292bd5000000000e037370",
+    "status": "success",
+    "processed_at": "2026-04-02 16:38:17"
+  },
+  "693a4a04000000000d03cc53": {
+    "title": "42岁的奇葩相亲局，姑娘要和我掰腕子",
+    "target_user": "coblin",
+    "comment_id": "693a7393000000000e037c50",
+    "status": "success",
+    "processed_at": "2026-04-02 16:54:42"
+  },
+  "691f4162000000000d00dbfd": {
+    "title": "在世纪佳缘，等温柔细腻的那个她",
+    "target_user": "丹尼尔Sc",
+    "comment_id": "69204017000000003802ff44",
+    "status": "success",
+    "processed_at": "2026-04-02 16:54:57"
+  },
+  "69bbb1bb000000001d01ba87": {
+    "title": "在Soul做了一场社交实验",
+    "target_user": "Brooke",
+    "comment_id": "69ca047f000000000103d001",
+    "status": "success",
+    "processed_at": "2026-04-02 17:06:00"
+  },
+  "69ad9097000000001a032b5a": {
+    "title": "聊聊SOUL",
+    "status": "no_intent",
+    "reason": "列表中没有任何评论表现出交友或脱单意向。评论主要集中在账号交易、寻找试探员或分享已婚已脱单经历，不符合找对象的需求。",
+    "processed_at": "2026-04-02 17:06:13"
+  },
+  "6879d9ec000000001202efba": {
+    "title": "未命名笔记",
+    "target_user": "Scintilla Malfoy🦋",
+    "comment_id": "6890c7e30000000029027525",
+    "status": "success",
+    "processed_at": "2026-04-02 17:06:29"
+  },
+  "6963d189000000001a036c53": {
+    "title": "未命名笔记",
+    "target_user": "gggyf06",
+    "comment_id": "6982cb0e000000000c008290",
+    "status": "success",
+    "processed_at": "2026-04-02 17:06:56"
+  },
+  "69435e17000000001e031b95": {
+    "title": "被soul上的她，一点点擦亮",
+    "target_user": "star",
+    "comment_id": "6948b597000000001702fffb",
+    "status": "success",
+    "processed_at": "2026-04-02 17:07:11"
+  },
+  "675d5d49000000000700f89a": {
+    "title": "单身联谊派对=等一个懂音乐、单身的你",
+    "target_user": "孙孙的奇妙小屋",
+    "comment_id": "6803afda000000001e03e386",
+    "status": "success",
+    "processed_at": "2026-04-02 17:15:09"
+  },
+  "69cb990e0000000021039b6e": {
+    "title": "未命名笔记",
+    "target_user": "小红薯68A1CCF7",
+    "comment_id": "69cc0bf1000000000103e90c",
+    "status": "success",
+    "processed_at": "2026-04-02 17:15:26"
+  },
+  "69cce9ae000000001a02058d": {
+    "title": "4.4-5📍免费落日音乐会-张杰专场！来听歌啦",
+    "target_user": "夏雨",
+    "comment_id": "69cdf2d0000000000d03d5b4",
+    "status": "success",
+    "processed_at": "2026-04-02 17:15:52"
+  },
+  "68d7e21a000000001302a76b": {
+    "title": "为脱单逼自己出门：JJ线下音乐会打卡",
+    "target_user": "有趣的灵魂",
+    "comment_id": "68d89feb000000000b01759f",
+    "status": "success",
+    "processed_at": "2026-04-02 17:16:08"
+  },
+  "69cbf6aa000000001d0192bf": {
+    "title": "周杰伦太阳之子清明节朝阳公园音乐会4.5",
+    "target_user": "比比西",
+    "comment_id": "69ce16cf000000000d03ed4d",
+    "status": "success",
+    "processed_at": "2026-04-02 17:17:00"
+  },
+  "66f2f061000000001b022c1c": {
+    "title": "百合网使用半个月感受",
+    "target_user": "不露聲色",
+    "comment_id": "69c773d0000000001500709a",
+    "status": "success",
+    "processed_at": "2026-04-02 17:17:29"
+  },
+  "694e4b2a000000001e004a7e": {
+    "title": "亲身经历告诉你为什么不要去任何线下婚介所",
+    "target_user": "一只香梨🍐",
+    "comment_id": "6971ae37000000000f02677a",
+    "status": "success",
+    "processed_at": "2026-04-02 17:17:46"
+  },
+  "69a245e80000000028022397": {
+    "title": "未命名笔记",
+    "target_user": "椰子",
+    "comment_id": "69a2b0f4000000000b037a30",
+    "status": "success",
+    "processed_at": "2026-04-02 17:18:02"
+  },
+  "69bfd906000000001b0233ca": {
+    "title": "勇闯婚介所",
+    "target_user": "Alan",
+    "comment_id": "69c3b6ea000000000c03161c",
+    "status": "success",
+    "processed_at": "2026-04-02 17:18:20"
+  },
+  "696396d900000000210303a9": {
+    "title": "勇闯深圳相亲机构实录🤯 男生视角纯干货",
+    "target_user": "SERENDIPITY",
+    "comment_id": "69b2d51d0000000018022017",
+    "status": "success",
+    "processed_at": "2026-04-02 17:18:37"
+  },
+  "6989fe3a000000000c0360ab": {
+    "title": "婚介公司的“甜蜜陷阱”",
+    "target_user": "🌵",
+    "comment_id": "699608210000000011018a7b",
+    "status": "success",
+    "processed_at": "2026-04-02 17:19:02"
+  },
+  "68b5ab2f000000001c00b8d0": {
+    "title": "未命名笔记",
+    "status": "no_intent",
+    "reason": "所有评论均在探讨婚介行业乱象、骗局及平台信誉问题，表现出强烈的抵触和防御心理，无任何用户表达出相亲或交友的潜在意向。",
+    "processed_at": "2026-04-02 17:19:15"
+  },
+  "690319600000000007015dbb": {
+    "title": "未命名笔记",
+    "target_user": "巷子里的猫",
+    "comment_id": "69c616e9000000001803a385",
+    "status": "success",
+    "processed_at": "2026-04-02 17:19:28"
+  },
+  "68747c3e0000000012014a94": {
+    "title": "怎么高效利用dating app？",
+    "target_user": "被囚禁的鸟",
+    "comment_id": "689a061a000000002b02203f",
+    "status": "success",
+    "processed_at": "2026-04-02 17:19:46"
+  },
+  "688afbdd0000000023024446": {
+    "title": "28岁，我重启人生，闺蜜步入婚姻",
+    "status": "no_intent",
+    "reason": "所有评论均为情感鼓励、正能量共鸣或对摄影器材的关注，未提及个人情感状态、择偶标准或社交需求，缺乏明确的交友意向。",
+    "processed_at": "2026-04-02 17:19:59"
+  },
+  "696fa6af000000001a01f28b": {
+    "title": "未命名笔记",
+    "target_user": "三叔",
+    "comment_id": "69724df2000000001d009a0e",
+    "status": "success",
+    "processed_at": "2026-04-02 17:20:12"
+  },
+  "695b2fb8000000001e00f7c3": {
+    "title": "未命名笔记",
+    "target_user": "蓝白",
+    "comment_id": "695c7a1b000000001600f50b",
+    "status": "success",
+    "processed_at": "2026-04-02 17:20:28"
+  },
+  "69c4b793000000001f0038bc": {
+    "title": "深圳女找男，找一个165+的",
+    "target_user": "小红薯69CE83F0",
+    "comment_id": "69c4fb900000000019001db1",
+    "status": "success",
+    "processed_at": "2026-04-02 17:20:56"
+  },
+  "69c93e730000000022002b35": {
+    "title": "未命名笔记",
+    "target_user": "Davidcao",
+    "comment_id": "69cb86aa0000000001006487",
+    "status": "success",
+    "processed_at": "2026-04-02 17:21:13"
+  },
+  "6935ad2b00000000190265fd": {
+    "title": "未命名笔记",
+    "target_user": "后来的后来",
+    "comment_id": "69b7921f000000000d03fcee",
+    "status": "success",
+    "processed_at": "2026-04-02 17:21:46"
+  },
+  "69c223fb0000000023027c93": {
+    "title": "真诚女找男 看缘分",
+    "target_user": "李",
+    "comment_id": "69cd4252000000000f02f6e2",
+    "status": "success",
+    "processed_at": "2026-04-02 17:22:02"
+  },
+  "69c16de9000000001a032d4d": {
+    "title": "坐标深圳龙岗，男找女（对象）",
+    "target_user": "雪花酥苏苏",
+    "comment_id": "69ccb49900000000140098c2",
+    "status": "success",
+    "processed_at": "2026-04-02 17:22:19"
+  },
+  "69b780ac000000001b022ebd": {
+    "title": "深圳吃货搭子群｜聊天饭搭子/脱单交友",
+    "target_user": "是啊信子呀",
+    "comment_id": "69bab9ca00000000140334b1",
+    "status": "success",
+    "processed_at": "2026-04-02 17:22:37"
+  },
+  "69cd2cca0000000022027153": {
+    "title": "深圳找对象，男生找女生",
+    "target_user": "一只圆",
+    "comment_id": "69cde5e900000000010045e5",
+    "status": "success",
+    "processed_at": "2026-04-02 17:22:55"
+  },
+  "695a5af1000000001e037236": {
+    "title": "女找男",
+    "target_user": "小驹",
+    "comment_id": "695ae722000000001d0271b8",
+    "status": "success",
+    "processed_at": "2026-04-02 17:30:14"
+  },
+  "68f223b5000000000303470b": {
+    "title": "找一个一起跑全马的男盆友",
+    "target_user": "黄上（半身不遂版）",
+    "comment_id": "68f244170000000037012f6b",
+    "status": "success",
+    "processed_at": "2026-04-02 17:30:31"
+  },
+  "69a2e0e200000000230390e8": {
+    "title": "做我男朋友 我陪你跑步 给你做好吃的",
+    "target_user": "豪先森【励志前行】",
+    "comment_id": "69a6d9db0000000015015d3a",
+    "status": "success",
+    "processed_at": "2026-04-02 17:30:54"
+  },
+  "69cbd0ee000000002301148c": {
+    "title": "未命名笔记",
+    "target_user": "Kk",
+    "comment_id": "69cd70e20000000011019473",
+    "status": "success",
+    "processed_at": "2026-04-02 17:31:10"
+  },
+  "6936942e000000000d00c8e0": {
+    "title": "蹲个男朋友，一起跑步！",
+    "target_user": "梁皓宇",
+    "comment_id": "6936c6580000000038032a3e",
+    "status": "success",
+    "processed_at": "2026-04-02 17:31:35"
+  },
+  "6885a490000000002400cf84": {
+    "title": "👫XHS分配对象～一场跑步一段关系",
+    "target_user": "蓝小俞",
+    "comment_id": "688a24b3000000002b0217f5",
+    "status": "success",
+    "processed_at": "2026-04-02 17:32:09"
+  },
+  "69ccd0af000000002003a032": {
+    "title": "这是一条超认真的脱单贴～～",
+    "target_user": "一起吃🦐吧",
+    "comment_id": "69cd14800000000015000852",
+    "status": "success",
+    "processed_at": "2026-04-02 17:32:25"
+  },
+  "69ba02be0000000021012dfe": {
+    "title": "牡丹如何脱单呢",
+    "target_user": "徐俊大",
+    "comment_id": "69bffd4e000000000202ad11",
+    "status": "success",
+    "processed_at": "2026-04-02 17:32:48"
+  },
+  "6831d068000000000c03839d": {
+    "title": "谈恋爱一定要找爱跑步的",
+    "target_user": "幸福的四季豆🌻",
+    "comment_id": "6834030a0000000007028f67",
+    "status": "success",
+    "processed_at": "2026-04-02 17:33:05"
+  },
+  "6822cd90000000002202f57e": {
+    "title": "🏃‍♀️在大学操场跑步捡到一个男朋友",
+    "target_user": "橙橙跑步去🍊",
+    "comment_id": "682540bb000000000b01d167",
+    "status": "success",
+    "processed_at": "2026-04-02 17:33:23"
+  },
+  "697198f2000000000d00ba49": {
+    "title": "未命名笔记",
+    "target_user": "52",
+    "comment_id": "6972e71b00000000180381f5",
+    "status": "success",
+    "processed_at": "2026-04-02 17:33:59"
+  },
+  "69a682e0000000001600b118": {
+    "title": "本人为脱单做出的努力（25年版）",
+    "target_user": "下一秒心动💗",
+    "comment_id": "69a7eebf000000001500cf88",
+    "status": "success",
+    "processed_at": "2026-04-02 17:34:18"
+  },
+  "6938eb45000000001b030045": {
+    "title": "推荐个30岁爱跑步男生一起做搭子有吗",
+    "target_user": "。*￠^",
+    "comment_id": "6938ef75000000001702f25f",
+    "status": "success",
+    "processed_at": "2026-04-02 17:34:43"
+  },
+  "677020f3000000000b0140b2": {
+    "title": "跑步人相亲🏃🏾‍➡️",
+    "target_user": "..",
+    "comment_id": "67713fd0000000001102ea5d",
+    "status": "success",
+    "processed_at": "2026-04-02 17:35:08"
+  },
+  "685ea6490000000012023e7c": {
+    "title": "普通单身女孩脱单指南（一）",
+    "target_user": "黎耀辉去减肥",
+    "comment_id": "68624f15000000002000c1e1",
+    "status": "success",
+    "processed_at": "2026-04-02 17:35:24"
+  },
+  "68b45d1f000000001d034980": {
+    "title": "37岁晚婚|为了脱单我试过的运动活动大公开",
+    "target_user": "小Co姐",
+    "comment_id": "68b82b3300000000020036f5",
+    "status": "success",
+    "processed_at": "2026-04-02 17:35:51"
+  },
+  "67cbf1300000000029031993": {
+    "title": "想谈恋爱了就去跑步吧",
+    "target_user": "AJie",
+    "comment_id": "67cbf1b5000000000f031cd9",
+    "status": "success",
+    "processed_at": "2026-04-02 17:36:17"
+  },
+  "69b2b1770000000006008c83": {
+    "title": "想脱单了，男找女版，希望真诚遇到真诚。",
+    "target_user": "momo",
+    "comment_id": "69bb9d02000000000202b23f",
+    "status": "success",
+    "processed_at": "2026-04-02 17:36:34"
+  },
+  "68292ad50000000023003668": {
+    "title": "找个一起跑步的男朋友难不难呀？",
+    "target_user": "林不赖",
+    "comment_id": "682a969500000000080274ba",
+    "status": "success",
+    "processed_at": "2026-04-02 17:37:02"
+  },
+  "69a2cea8000000001a02f76b": {
+    "title": "相亲贴，女找男（本人）",
+    "target_user": "晴天",
+    "comment_id": "69b4ff65000000000c032ba0",
+    "status": "success",
+    "processed_at": "2026-04-02 17:37:19"
+  },
+  "685bb6db0000000015023fb5": {
+    "title": "想脱单了",
+    "target_user": "王哪跑",
+    "comment_id": "69ce0b90000000000f00fc45",
+    "status": "success",
+    "processed_at": "2026-04-02 17:37:37"
+  },
+  "690dc89a0000000004016ff5": {
+    "title": "本人第一次网友面基的遭遇",
+    "target_user": "酷爱拍照的美食博主",
+    "comment_id": "690f783f0000000033006d82",
+    "status": "success",
+    "processed_at": "2026-04-08 18:46:15"
+  },
+  "69b8ba0400000000280096bc": {
+    "title": "跟老公在soul上匹配到",
+    "target_user": "ppxrk",
+    "comment_id": "69bfbb7a000000000100723b",
+    "status": "success",
+    "processed_at": "2026-04-08 18:46:33"
+  },
+  "64c20cf2000000000a018b46": {
+    "title": "💢我主良缘霸王条款、不予退款",
+    "target_user": "爱生活爱自己",
+    "comment_id": "65083c64000000001d00cc10",
+    "status": "success",
+    "processed_at": "2026-04-08 18:47:05"
+  },
+  "68164eaf000000002100325a": {
+    "title": "都2025年了，相亲机构咋还这么糟粕",
+    "target_user": "jason",
+    "comment_id": "68efbbef000000003803d4fb",
+    "status": "success",
+    "processed_at": "2026-04-08 18:49:24"
+  },
+  "69c3b353000000001d01e9f2": {
+    "title": "当一个人在北京频繁的打羽毛球。。。",
+    "status": "no_intent",
+    "reason": "当前所有评论内容均聚焦于打羽毛球或运动组队，属于特定运动场景下的互动，未体现出明确的有脱单或寻找恋爱对象的意向。",
+    "processed_at": "2026-04-08 18:49:50"
+  },
+  "6969b7bf000000001a023246": {
+    "title": "📢北京85-95后的专属快乐星球",
+    "target_user": "霉霉泡芙卷",
+    "comment_id": "698dcad40000000006031318",
+    "status": "success",
+    "processed_at": "2026-04-08 18:52:12"
+  },
+  "69b40833000000001e00efe2": {
+    "title": "苏州土著 普通人找个普通人",
+    "target_user": "不喝咖啡哟",
+    "comment_id": "69c344120000000002029f7a",
+    "status": "success",
+    "processed_at": "2026-04-08 18:52:45"
+  },
+  "673c82d100000000070339c9": {
+    "title": "拒绝无效社交，人一定要学会“胡说八道”",
+    "target_user": "卢卡",
+    "comment_id": "67409eae000000001b035e28",
+    "status": "success",
+    "processed_at": "2026-04-08 18:53:17"
   }
 }
