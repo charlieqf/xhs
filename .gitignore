@@ -53,3 +53,6 @@ images/publish_temp/*
 .DS_Store
 Thumbs.db
 *.zip
+prod/bot_lite_responses_*.json
+prod/comment_responses_*.json
+prod/processed_cache_lite.json

@@ -382,19 +382,25 @@ def main():
                         try:
                             # 1. 悬停并点击回复按钮
                             target_element.hover()
-                            time.sleep(0.5)
+                            time.sleep(1)
                             # 小红书的回复按钮可能叫 .reply, 或包含文字 “回复”
-                            reply_btn = target_element.locator(".reply, text='回复'").first
-                            reply_btn.click()
-                            time.sleep(0.5)
+                            try:
+                                reply_btn = target_element.locator("text='回复'").first
+                                if reply_btn.count() == 0:
+                                    reply_btn = target_element.locator(".reply").first
+                                reply_btn.click()
+                            except:
+                                # 如果上述定位依然失败，尝试直接点击整个评论区域，通常也能唤起输入框
+                                target_element.click()
+                            time.sleep(1)
 
-                            # 2. 填写输入框
-                            input_box = page.locator(".comment-input, #comment-textarea, div[contenteditable='true']").first
+                            # 2. 填写输入框（基于真实 DOM）
+                            input_box = page.locator("#content-textarea").first
                             input_box.fill(reply_content)
                             time.sleep(1)
 
-                            # 3. 发送
-                            send_btn = page.locator(".submit-btn, .send-btn, button:has-text('发送')").first
+                            # 3. 发送（基于真实 DOM）
+                            send_btn = page.locator("button.btn.submit").first
                             send_btn.click()
                             print("    -> ✅ 回复操作已模拟完成！")
                             total_replies += 1
