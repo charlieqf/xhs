@@ -911,6 +911,14 @@ class XiaohongshuPublisher:
     def _navigate(self, url: str):
         """Navigate the current tab to the given URL and wait for load."""
         print(f"[cdp_publish] Navigating to {url}")
+        
+        # Clear __INITIAL_STATE__ to prevent race conditions where the script 
+        # reads old data before the new page has finished loading.
+        try:
+            self._evaluate("window.__INITIAL_STATE__ = undefined;")
+        except Exception:
+            pass
+            
         self._send("Page.enable")
         self._send("Page.navigate", {"url": url})
         self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.0)
@@ -1518,6 +1526,13 @@ class XiaohongshuPublisher:
         keyword = keyword.strip()
         if not keyword:
             raise CDPError("Keyword cannot be empty.")
+
+        # Clear __INITIAL_STATE__ first so that if the new page takes time to load,
+        # we do not accidentally read the old page's data.
+        try:
+            self._evaluate("window.__INITIAL_STATE__ = undefined;")
+        except Exception:
+            pass
 
         # Navigate directly to the keyword search URL to avoid a double
         # page load (the old flow navigated to SEARCH_BASE_URL first, then
