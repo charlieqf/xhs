@@ -376,7 +376,7 @@ python scripts/chrome_launcher.py --kill
 
 ### 7. 评论截流机器人
 
-基于关键词自动搜索笔记并回复有相亲意向的评论。
+基于关键词自动搜索笔记并回复有业务意向的评论。
 通用版机器人 `prod/general_comment_bot.py <profile>` 会优先使用 LLM 生成搜索关键词；如果 LLM 不可用或生成失败，则自动回退到 profile 中的静态关键词库，并在日志中展示真实来源。
 
 ```bash
@@ -384,11 +384,19 @@ python scripts/chrome_launcher.py --kill
 python scripts/chrome_launcher.py --restart
 python scripts/cdp_publish.py check-login
 
-# 运行评论机器人
-python prod/comment_bot.py
+# 运行通用版评论机器人
+python prod/general_comment_bot.py medical_beauty
 ```
 
-配置文件：`prod/config.json`（关键词数量、评论门槛、延迟等）+ `prod/keywords.json`（关键词模板与城市/平台/运动列表）。
+通用版配置文件：`prod/profiles/<profile>.json`。
+
+- `config`：关键词数量、评论门槛、延迟等运行参数。
+- `keywords`：静态关键词、模板关键词、占位符池。
+- `llm_prompts`：LLM 提示词配置，包含 `keyword_system`、`keyword_user`、`comment_system`、`comment_user`。
+
+`llm_prompts` 支持 `${变量名}` 模板变量。关键词生成可用 `service_name`、`business_topic`、`intent_terms`、`batch_size`、`sample_keywords_json`、`recent_used_json`；评论分析可用 `service_desc`、`intent_terms`、`reply_style`、`reply_max_chars`、`comments_text`、`comments_count`。
+
+旧版配置仍是：`prod/config.json`（关键词数量、评论门槛、延迟等）+ `prod/keywords.json`（关键词模板与城市/平台/运动列表），运行 `python prod/comment_bot.py`。
 
 输出：
 - `prod/comment_responses.json`：回复记录

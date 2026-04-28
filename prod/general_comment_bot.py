@@ -51,7 +51,6 @@ OPENROUTER_API_KEY = (
 
 PROFILES_DIR = os.path.join(script_dir, "profiles")
 
-
 # ============================================================
 #  Profile 加载
 # ============================================================
@@ -73,6 +72,31 @@ def load_profile(profile_name: str) -> dict:
         )
     with open(profile_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def render_prompt(template: str, values: dict[str, object]) -> str:
+    """使用 profile 中的字符串模板渲染提示词。"""
+    return re.sub(
+        r"\$\{([A-Za-z_]\w*)\}",
+        lambda match: str(values.get(match.group(1), match.group(0))),
+        template,
+    )
+
+
+def get_prompt(profile: dict, name: str) -> str:
+    """从 profile.llm_prompts 中读取提示词，保留旧字段兼容。"""
+    prompts = profile.get("llm_prompts", {})
+    if isinstance(prompts, dict) and prompts.get(name):
+        return str(prompts[name])
+
+    legacy_fields = {
+        "comment_system": "llm_system_role",
+    }
+    legacy_field = legacy_fields.get(name)
+    if legacy_field and profile.get(legacy_field):
+        return str(profile[legacy_field])
+
+    raise ValueError(f"profile 缺少 llm_prompts.{name} 配置")
 
 
 # ============================================================
@@ -162,31 +186,18 @@ def generate_keywords_with_llm(
     business_topic = profile.get("llm_keyword_topic", business_name)
     intent_terms = profile.get("llm_intent_terms", business_name)
 
-    prompt = (
-        f"你是一个小红书营销关键词生成专家。我们的业务是{business_topic}。\n"
-        f"\n"
-        f"请基于以下参考关键词的风格和主题，生成 {batch_size} 个全新的小红书搜索关键词。\n"
-        f"\n"
-        f"参考关键词样本：\n"
-        f"{json.dumps(sample_keywords, ensure_ascii=False)}\n"
-        f"\n"
-        f"以下关键词已经使用过，请不要重复：\n"
-        f"{json.dumps(recent_used, ensure_ascii=False)}\n"
-        f"\n"
-        f"生成要求：\n"
-        f"1. 关键词必须是小红书用户真实会搜索的内容\n"
-        f"2. 覆盖多个角度：痛点、场景需求、人群、地域（限制在福州）、价格、测评、兴趣等\n"
-        f"3. 包含长尾关键词（3-8个字）和短关键词（2-4个字）混合\n"
-        f"4. 可以包含口语化、情绪化的表达\n"
-        f"5. 可以蹭热点话题、节日、季节相关\n"
-        f"6. 每个关键词都要跟 {intent_terms} 相关\n"
-        f"7. 不要带编号和引号\n"
-        f"\n"
-        f'请严格按以下JSON格式返回（不要返回除JSON以外的任何内容）：\n'
-        f'{{\n'
-        f'  "keywords": ["关键词1", "关键词2", ...]\n'
-        f'}}'
+    prompt = render_prompt(
+        get_prompt(profile, "keyword_user"),
+        {
+            "service_name": business_name,
+            "business_topic": business_topic,
+            "intent_terms": intent_terms,
+            "batch_size": batch_size,
+            "sample_keywords_json": json.dumps(sample_keywords, ensure_ascii=False),
+            "recent_used_json": json.dumps(recent_used, ensure_ascii=False),
+        },
     )
+    system_prompt = get_prompt(profile, "keyword_system")
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -196,13 +207,7 @@ def generate_keywords_with_llm(
     payload = {
         "model": profile.get("llm_model", "google/gemini-3-flash-preview"),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a Chinese social media keyword research expert. "
-                    "Generate diverse, realistic search keywords for Xiaohongshu."
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     }
@@ -287,10 +292,14 @@ def evaluate_comments_with_llm(
         "像真实小红书用户，友好、真诚、有网感",
     )
     reply_max_chars = profile.get("llm_reply_max_chars", 50)
-    system_role = profile.get(
-        "llm_system_role",
-        "You are a helpful marketing assistant that analyzes comments and "
-        "generates natural, concise Chinese replies.",
+    system_prompt = render_prompt(
+        get_prompt(profile, "comment_system"),
+        {
+            "service_desc": service_desc,
+            "intent_terms": intent_terms,
+            "reply_style": reply_style,
+            "reply_max_chars": reply_max_chars,
+        },
     )
 
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -305,41 +314,22 @@ def evaluate_comments_with_llm(
         content = c.get("content", "").replace("\n", " ")
         comments_text += f"[{i + 1}] 用户: {user}, 评论: {content}\n"
 
-    prompt = f"""
-请分析以下来自小红书帖子的评论。
-你的任务是：
-1. 判断哪一条评论的用户表现出了最强烈的 {intent_terms} 意向（有潜在需求）。
-2. 如果没有任何评论有 {intent_terms} 意向，请返回 selected_index 为 -1。
-3. 如果有意向,针对最有意向的评论生成一条回复。
-4. 回复核心目的：口语化的真诚地跟对方分享ta关心问题的解决方案，不要在回复中体现任何广告/商业目的，回复要遵守“真诚分享，友好互动”的小红书社区价值观。
-5. 服务介绍（可适当缩写）：「{service_desc}」
-6. 回复要求：
-   - {reply_style}
-   - 字数严格控制在{reply_max_chars}字以内
-   - 不要使用 emoji 表情
-   - 不要邀请对方发私信，或者让对方查看主页等操作
-   - 用短句，体现口语化特点
-   - 加上噢，啦，呢，这样的语气词，尽量不要用句号
-7. 场景1，如果对方表达了脱毛需求，但不知道最佳实践，可以的回复示例：翠绿宝石属实属于天花板了，其他激光也 OK就是时间长一点。翠绿宝石自带冷喷舒适度比较高。但话说回来，主包说的是非常真实的，而且特别不建议用脱毛膏或者是子去拔还有家用脱毛仪(超自律手工活力党当我没说。有说就是你对。)
-8. 场景2，如果对方有用过翠绿宝石脱毛，可以用类似的方式回复："确实，脱毛还得是翠绿宝石"/"真的，做过翠绿宝石脱毛的都知道有多香"/"翠绿宝石做三次就少很多多多了"/"翠绿宝石脱毛机构舍得冷媒开够量，真的不疼"/"翠绿宝石脱毛做一次顶三次啊"/"悬浮脱毛不接触皮肤，有冷喷体验感好"/"翠绿宝石是悬浮脱毛，不接触皮肤，拒绝交叉感染"
-9. 其他场景采用类似的回复话术。
-
-
-评论列表：
-{comments_text}
-
-请严格按照以下JSON格式返回（不要返回除JSON以外的任何内容）：
-{{
-  "selected_index": 整数, 选中的评论编号(1-{len(comments)})，无意向时为 -1,
-  "reason": "选择或跳过的理由",
-  "generated_reply": "回复文本（无意向时为空字符串）"
-}}
-"""
+    prompt = render_prompt(
+        get_prompt(profile, "comment_user"),
+        {
+            "service_desc": service_desc,
+            "intent_terms": intent_terms,
+            "reply_style": reply_style,
+            "reply_max_chars": reply_max_chars,
+            "comments_text": comments_text,
+            "comments_count": len(comments),
+        },
+    )
 
     payload = {
         "model": profile.get("llm_model", "google/gemini-3-flash-preview"),
         "messages": [
-            {"role": "system", "content": system_role},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
     }

@@ -77,7 +77,7 @@ metadata:
 
 ### 工作原理
 
-1. 通用版 `prod/general_comment_bot.py <profile>` 优先使用 LLM 生成搜索关键词；失败时回退到 profile 静态关键词库。旧版 `prod/comment_bot.py` 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
+1. 通用版 `prod/general_comment_bot.py <profile>` 优先使用 LLM 生成搜索关键词；失败时回退到 profile 静态关键词库。LLM 的 system/user 提示词统一配置在 `prod/profiles/<profile>.json` 的 `llm_prompts` 中。旧版 `prod/comment_bot.py` 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
 2. 遍历关键词搜索小红书笔记。
 3. 对每篇笔记提取 DOM 评论，送 LLM（OpenRouter Gemini）分析相亲意向。
 4. 有意向时自动回复该评论（≤50字），无意向则跳过。
@@ -90,11 +90,29 @@ metadata:
 python scripts/chrome_launcher.py --restart
 python scripts/cdp_publish.py check-login
 
-# 运行评论机器人
-python prod/comment_bot.py
+# 运行通用版评论机器人
+python prod/general_comment_bot.py medical_beauty
 ```
 
-### 配置说明（prod/config.json）
+### 通用版 Profile 配置说明（prod/profiles/<profile>.json）
+
+| 参数 | 说明 |
+|------|------|
+| `service_name` | 当前业务名称 |
+| `service_desc` | 给 LLM 参考的业务说明 |
+| `llm_keyword_topic` | 关键词生成的业务主题 |
+| `llm_intent_terms` | 评论意向判断的业务意向词 |
+| `llm_reply_style` | 回复风格描述，可被 `llm_prompts.comment_user` 引用 |
+| `llm_reply_max_chars` | 回复最大字数，可被 `llm_prompts.comment_user` 引用 |
+| `llm_model` | OpenRouter 模型名 |
+| `llm_prompts.keyword_system` | 关键词生成 system prompt |
+| `llm_prompts.keyword_user` | 关键词生成 user prompt |
+| `llm_prompts.comment_system` | 评论分析 system prompt |
+| `llm_prompts.comment_user` | 评论分析 user prompt |
+
+`llm_prompts` 使用 `${变量名}` 模板。关键词提示词可引用 `service_name`、`business_topic`、`intent_terms`、`batch_size`、`sample_keywords_json`、`recent_used_json`；评论提示词可引用 `service_desc`、`intent_terms`、`reply_style`、`reply_max_chars`、`comments_text`、`comments_count`。
+
+### 旧版配置说明（prod/config.json）
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
