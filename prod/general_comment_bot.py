@@ -387,33 +387,187 @@ def save_cache(profile_name: str, cache: dict):
 
 def _scroll_search_page(publisher: XiaohongshuPublisher, pixels: int = 600):
     """在搜索结果页向下滚动指定像素，触发懒加载。"""
-    publisher._evaluate(f"window.scrollBy(0, {pixels});")
+    publisher._evaluate(f"""
+        (() => {{
+            const delta = {pixels};
+            const isScrollable = (el) => {{
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const overflowY = style.overflowY || "";
+                const canScroll = /(auto|scroll|overlay)/.test(overflowY);
+                return canScroll && el.scrollHeight > el.clientHeight + 40;
+            }};
+
+            const candidates = [
+                document.scrollingElement,
+                document.documentElement,
+                document.body,
+                ...document.querySelectorAll("main, [class*='search'], [class*='feeds'], [class*='waterfall'], [class*='container'], div")
+            ].filter((el, index, arr) => el && arr.indexOf(el) === index);
+
+            const target = candidates
+                .filter(isScrollable)
+                .sort((a, b) => {{
+                    const aRange = a.scrollHeight - a.clientHeight;
+                    const bRange = b.scrollHeight - b.clientHeight;
+                    return bRange - aRange;
+                }})[0] || document.scrollingElement || document.documentElement || document.body;
+
+            target.scrollBy({{ top: delta, behavior: "instant" }});
+            window.dispatchEvent(new WheelEvent("wheel", {{ deltaY: delta, bubbles: true }}));
+            return true;
+        }})()
+    """)
     publisher._sleep(1.2, minimum_seconds=0.8)
 
 
-def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
-    """检查 feed_id 对应的可点击卡片是否存在于当前 DOM 中。"""
-    return bool(publisher._evaluate(f"""
+def _card_rect_js(feed_id: str) -> str:
+    """返回定位指定笔记卡片点击区域的 JS 片段。"""
+    return f"""
         (() => {{
             const feedId = "{feed_id}";
-            const links = document.querySelectorAll('a[href*="' + feedId + '"]');
-            for (const link of links) {{
-                const rect = link.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) return true;
+            const visibleRect = (el) => {{
+                if (!(el instanceof HTMLElement)) return null;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 20 || rect.height < 20) return null;
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) return null;
+                if (rect.right <= 0 || rect.left >= window.innerWidth) return null;
+                return rect;
+            }};
+
+            const cardSelector = [
+                "section.note-item",
+                "div.note-item",
+                "[class*='note-item']",
+                "[class*='feed']",
+                "[class*='card']",
+                "article",
+                "li"
+            ].join(",");
+
+            const candidates = [];
+            for (const link of document.querySelectorAll('a[href*="' + feedId + '"]')) {{
+                candidates.push(link);
+                const card = link.closest(cardSelector);
+                if (card) candidates.push(card);
             }}
-            const dataEls = document.querySelectorAll(
+            for (const el of document.querySelectorAll(
                 '[data-note-id="' + feedId + '"], ' +
                 '[data-feed-id="' + feedId + '"], ' +
                 '[note-id="' + feedId + '"], ' +
                 '[feed-id="' + feedId + '"]'
-            );
-            for (const el of dataEls) {{
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) return true;
+            )) {{
+                candidates.push(el);
+                const card = el.closest(cardSelector);
+                if (card) candidates.push(card);
+            }}
+
+            for (const el of candidates) {{
+                const rect = visibleRect(el);
+                if (!rect) continue;
+                return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+            }}
+            return null;
+        }})()
+    """
+
+
+def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
+    """检查 feed_id 对应的可点击卡片是否在当前可见 DOM 中。"""
+    return bool(publisher._evaluate(_card_rect_js(feed_id)))
+
+
+def _center_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
+    """把目标卡片滚到视口中间，兼容自定义滚动容器。"""
+    return bool(publisher._evaluate(f"""
+        (() => {{
+            const feedId = "{feed_id}";
+            const cardSelector = [
+                "section.note-item",
+                "div.note-item",
+                "[class*='note-item']",
+                "[class*='feed']",
+                "[class*='card']",
+                "article",
+                "li"
+            ].join(",");
+            const selectors = [
+                'a[href*="' + feedId + '"]',
+                '[data-note-id="' + feedId + '"]',
+                '[data-feed-id="' + feedId + '"]',
+                '[note-id="' + feedId + '"]',
+                '[feed-id="' + feedId + '"]'
+            ];
+            for (const selector of selectors) {{
+                for (const node of document.querySelectorAll(selector)) {{
+                    if (!(node instanceof HTMLElement)) continue;
+                    const target = node.closest(cardSelector) || node;
+                    target.scrollIntoView({{ behavior: "instant", block: "center", inline: "center" }});
+                    return true;
+                }}
             }}
             return false;
         }})()
     """))
+
+
+def _seek_card_by_scrolling(
+    publisher: XiaohongshuPublisher,
+    feed_id: str,
+    max_steps: int = 24,
+) -> bool:
+    """通过真实滚动搜索结果容器，让虚拟列表把目标卡片渲染出来。"""
+    if _find_card_in_dom(publisher, feed_id):
+        return True
+    if _center_card_in_dom(publisher, feed_id):
+        publisher._sleep(1.0, minimum_seconds=0.5)
+        if _find_card_in_dom(publisher, feed_id):
+            return True
+
+    for step in range(max_steps):
+        _scroll_search_page(publisher, pixels=420 + (step % 3) * 120)
+        if _find_card_in_dom(publisher, feed_id):
+            return True
+
+    publisher._evaluate("""
+        (() => {
+            const roots = [
+                document.scrollingElement,
+                document.documentElement,
+                document.body,
+                ...document.querySelectorAll("main, [class*='search'], [class*='feeds'], [class*='waterfall'], [class*='container'], div")
+            ];
+            for (const root of roots) {
+                if (root && root.scrollHeight > root.clientHeight + 40) {
+                    root.scrollTo({ top: 0, behavior: "instant" });
+                }
+            }
+            return true;
+        })()
+    """)
+    publisher._sleep(1.2, minimum_seconds=0.6)
+
+    for step in range(max_steps):
+        if _find_card_in_dom(publisher, feed_id):
+            return True
+        _scroll_search_page(publisher, pixels=420 + (step % 3) * 120)
+    visible_ids = publisher._evaluate("""
+        (() => Array.from(document.querySelectorAll("a[href*='/explore/']"))
+            .map((link) => {
+                try {
+                    const url = new URL(link.href, window.location.origin);
+                    const match = url.pathname.match(/\\/explore\\/([^/?#]+)/);
+                    return match ? match[1] : "";
+                } catch (_) {
+                    return "";
+                }
+            })
+            .filter(Boolean)
+            .slice(0, 12)
+        )()
+    """)
+    print(f"    -> [调试] 未定位到目标卡片，可见笔记ID: {visible_ids}")
+    return False
 
 
 def click_note_card(
@@ -422,101 +576,24 @@ def click_note_card(
     feed_index: int = 0,
 ) -> bool:
     """通过 CDP 鼠标点击指定 feed_id 的笔记卡片封面。"""
-    if not _find_card_in_dom(publisher, feed_id) and feed_index > 0:
-        estimated_y = (feed_index // 2) * 280
-        publisher._evaluate(
-            f"window.scrollTo({{ top: {estimated_y}, behavior: 'instant' }});"
-        )
-        publisher._sleep(1.5, minimum_seconds=0.8)
+    _ = feed_index  # 保留参数，调用方日志仍按搜索结果顺序展示。
+    if not _seek_card_by_scrolling(publisher, feed_id):
+        return False
 
-    max_scroll_attempts = 10
-    if not _find_card_in_dom(publisher, feed_id):
-        for _ in range(max_scroll_attempts):
-            _scroll_search_page(publisher, pixels=500)
-            if _find_card_in_dom(publisher, feed_id):
-                break
-        else:
-            publisher._evaluate("window.scrollTo({ top: 0, behavior: 'instant' });")
-            publisher._sleep(1.5, minimum_seconds=0.8)
-            for _ in range(max_scroll_attempts):
-                if _find_card_in_dom(publisher, feed_id):
-                    break
-                _scroll_search_page(publisher, pixels=500)
-            else:
-                return False
-
-    scroll_ok = publisher._evaluate(f"""
-        (() => {{
-            const feedId = "{feed_id}";
-            const links = document.querySelectorAll('a[href*="' + feedId + '"]');
-            for (const link of links) {{
-                link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-                return true;
-            }}
-            const dataEls = document.querySelectorAll(
-                '[data-note-id="' + feedId + '"], ' +
-                '[data-feed-id="' + feedId + '"]'
-            );
-            for (const el of dataEls) {{
-                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-                return true;
-            }}
-            return false;
-        }})()
-    """)
+    scroll_ok = _center_card_in_dom(publisher, feed_id)
     if not scroll_ok:
         return False
     publisher._sleep(1.5, minimum_seconds=0.8)
 
     for retry in range(3):
-        rect_js = f"""
-            (() => {{
-                const feedId = "{feed_id}";
-                const links = document.querySelectorAll('a');
-                for (const link of links) {{
-                    if (!link.href || !link.href.includes(feedId)) continue;
-                    const rect = link.getBoundingClientRect();
-                    if (rect.width > 20 && rect.height > 20 &&
-                        rect.bottom > 0 && rect.top < window.innerHeight) {{
-                        return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
-                    }}
-                }}
-                const dataEls = document.querySelectorAll(
-                    '[data-note-id="' + feedId + '"], ' +
-                    '[data-feed-id="' + feedId + '"], ' +
-                    '[note-id="' + feedId + '"], ' +
-                    '[feed-id="' + feedId + '"]'
-                );
-                for (const el of dataEls) {{
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 20 && rect.height > 20 &&
-                        rect.bottom > 0 && rect.top < window.innerHeight) {{
-                        return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
-                    }}
-                }}
-                return null;
-            }})()
-        """
         try:
-            publisher._click_element_by_cdp("note card cover", rect_js)
+            publisher._click_element_by_cdp("note card cover", _card_rect_js(feed_id))
             return True
         except Exception as e:
             if retry < 2:
                 print(f"    -> [调试] CDP 点击卡片失败（重试 {retry + 1}/2）: {e}")
                 publisher._sleep(1.0, minimum_seconds=0.5)
-                publisher._evaluate(f"""
-                    (() => {{
-                        const feedId = "{feed_id}";
-                        const links = document.querySelectorAll('a');
-                        for (const link of links) {{
-                            if (link.href && link.href.includes(feedId)) {{
-                                link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
-                                return true;
-                            }}
-                        }}
-                        return false;
-                    }})()
-                """)
+                _center_card_in_dom(publisher, feed_id)
                 publisher._sleep(1.0, minimum_seconds=0.5)
             else:
                 print(f"    -> [调试] CDP 点击卡片失败: {e}")
@@ -875,10 +952,18 @@ def main():
                     )
 
                     try:
-                        if not click_note_card(publisher, feed_id, feed_index=feed_idx - 1):
+                        if not click_note_card(
+                            publisher,
+                            feed_id,
+                            feed_index=feed_idx - 1,
+                        ):
                             print("    -> 笔记卡片初次点击失败。尝试向下翻页并重试...")
                             _scroll_search_page(publisher, pixels=800)
-                            if not click_note_card(publisher, feed_id, feed_index=0):
+                            if not click_note_card(
+                                publisher,
+                                feed_id,
+                                feed_index=0,
+                            ):
                                 print("    -> [跳过] 重试点击依然失败。")
                                 total_skipped += 1
                                 continue

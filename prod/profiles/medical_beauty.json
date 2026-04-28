@@ -22,8 +22,8 @@
         "post_per_keyword": 10,
         "keyword_delay_min": 45,
         "keyword_delay_max": 90,
-        "post_delay_min": 30,
-        "post_delay_max": 60,
+        "post_delay_min": 3,
+        "post_delay_max": 6,
         "round_delay_min": 60,
         "round_delay_max": 120
     },
