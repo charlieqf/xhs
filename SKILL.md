@@ -58,7 +58,7 @@ metadata:
 
 1. 先检查小红书主页登录状态（`XHS_HOME_URL`，非创作者中心）。
 2. 若用户需要首页推荐流，执行 `list-feeds` 获取首页推荐笔记列表。
-3. 若用户需要关键词搜索，执行 `search-feeds` 获取笔记列表（默认会先抓取搜索下拉推荐词，结果字段为 `recommended_keywords`）。
+3. 若用户需要关键词搜索，执行 `search-feeds` 获取笔记列表；搜索会为每个关键词切换到新的小红书首页标签页并关闭旧搜索标签页，通过搜索框输入关键词并点击搜索图标提交，避免直接跳转搜索 URL。
 4. 若用户需要详情，从搜索结果中取 `id` + `xsecToken` 再执行 `get-feed-detail`；如用户明确要更多评论，可加 `--load-all-comments` 等参数。
 5. 若用户需要发表评论，执行 `post-comment-to-feed`（一级评论；必填 `feed_id` / `xsec_token` / `content`）。
 6. 若用户需要回复某条评论，执行 `respond-comment`（可用 `comment_id` / `comment_author` / `comment_snippet` 定位目标评论）。
@@ -77,7 +77,7 @@ metadata:
 
 ### 工作原理
 
-1. 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
+1. 通用版 `prod/general_comment_bot.py <profile>` 优先使用 LLM 生成搜索关键词；失败时回退到 profile 静态关键词库。旧版 `prod/comment_bot.py` 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
 2. 遍历关键词搜索小红书笔记。
 3. 对每篇笔记提取 DOM 评论，送 LLM（OpenRouter Gemini）分析相亲意向。
 4. 有意向时自动回复该评论（≤50字），无意向则跳过。
@@ -277,7 +277,10 @@ python scripts/cdp_publish.py get-feed-detail \
 ```
 
 说明：`list-feeds` 返回首页推荐 feed 列表。
-说明：`search-feeds` 输出中包含 `recommended_keywords_count` 与 `recommended_keywords`，表示回车前搜索框下拉推荐词。
+说明：`search-feeds` 输出中保留 `recommended_keywords_count` 与 `recommended_keywords` 字段；当前反风控搜索流程优先通过输入框和搜索图标提交，推荐词字段可能为空。
+说明：若搜索结果页未刷新 `window.__INITIAL_STATE__`，`search-feeds` 会从渲染后的结果卡片 DOM 兜底提取笔记 ID 与 `xsec_token`；列表页评论数可能未知，评论机器人会打开详情后再校验。
+说明：评论机器人打开笔记详情时兼容搜索页内浮层；若详情 state 未刷新，会以详情/评论 DOM 可见作为加载成功，并滚动到评论区后提取评论。
+说明：评论机器人在已打开详情浮层内回复时直接使用当前页面上下文；只有需要重新导航详情页时才强制要求 `xsec_token`。
 说明：`get-feed-detail --load-all-comments` 会先滚动评论区，并可选点击“更多回复”后再提取详情，同时额外返回 `comment_loading`。
 说明：`check-login` 与主页登录检查默认启用本地缓存（12h，仅缓存“已登录”），到期后自动重新网页校验。
 

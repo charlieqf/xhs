@@ -151,15 +151,20 @@ class FeedExplorer:
         return False
 
     def _wait_for_search_state(self):
-        """Wait until search feed data is available in __INITIAL_STATE__."""
+        """Wait until search feed data is available in state or rendered DOM."""
         ready = self._wait_js_condition(
             """
             (() => {
                 const state = window.__INITIAL_STATE__;
-                return !!(
+                if (
                     state &&
                     state.search &&
                     state.search.feeds
+                ) {
+                    return true;
+                }
+                return !!document.querySelector(
+                    "a[href*='/explore/'], section.note-item, div.note-item, [class*='note-item']"
                 );
             })()
             """,
@@ -168,7 +173,7 @@ class FeedExplorer:
         )
         if not ready:
             raise FeedExplorerError(
-                "Timed out waiting for search data in window.__INITIAL_STATE__."
+                "Timed out waiting for search data in state or rendered DOM."
             )
 
     def _wait_for_detail_state(self):
@@ -583,7 +588,7 @@ class FeedExplorer:
         )
 
     def _extract_search_feeds(self) -> list[dict[str, Any]]:
-        """Extract feeds array from search initial state."""
+        """Extract feeds array from search initial state, with DOM fallback."""
         raw = self._evaluate(
             """
             (() => {
@@ -616,6 +621,89 @@ class FeedExplorer:
 
         if not isinstance(parsed, list):
             raise FeedExplorerError("Search feed payload is not a list.")
+        return parsed
+
+    def _extract_search_feeds_from_dom(self) -> list[dict[str, Any]]:
+        """Extract minimal feed records from rendered search result cards."""
+        raw = self._evaluate(
+            """
+            (() => {
+                const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+                const cardSelector = [
+                    "section.note-item",
+                    "div.note-item",
+                    "[class*='note-item']",
+                    "[class*='feed']",
+                ].join(",");
+                const output = [];
+                const seen = new Set();
+
+                const anchors = Array.from(document.querySelectorAll("a[href*='/explore/']"));
+                for (const anchor of anchors) {
+                    if (!(anchor instanceof HTMLAnchorElement)) continue;
+
+                    let url;
+                    try {
+                        url = new URL(anchor.href, window.location.origin);
+                    } catch (_) {
+                        continue;
+                    }
+
+                    const match = url.pathname.match(/\\/explore\\/([^/?#]+)/);
+                    const id = match ? match[1] : "";
+                    if (!id || seen.has(id)) continue;
+
+                    const card = anchor.closest(cardSelector) || anchor.parentElement || anchor;
+                    let title = "";
+                    if (card instanceof HTMLElement) {
+                        const titleEl = card.querySelector(
+                            ".title, [class*='title'], [class*='desc'], [class*='name']"
+                        );
+                        title = normalize(titleEl && titleEl.textContent);
+                    }
+                    if (!title) {
+                        title = normalize(anchor.getAttribute("title") || anchor.getAttribute("aria-label"));
+                    }
+                    if (!title) {
+                        const img = anchor.querySelector("img");
+                        title = normalize(img && (img.getAttribute("alt") || img.getAttribute("title")));
+                    }
+                    if (!title && card instanceof HTMLElement) {
+                        const lines = normalize(card.innerText).split(" ").filter(Boolean);
+                        title = lines[0] || "未命名笔记";
+                    }
+
+                    seen.add(id);
+                    output.push({
+                        id,
+                        xsecToken: url.searchParams.get("xsec_token") || "",
+                        _commentCountUnknown: true,
+                        noteCard: {
+                            displayTitle: title || "未命名笔记",
+                            interactInfo: { commentCount: "0" },
+                            user: { xsecToken: url.searchParams.get("xsec_token") || "" },
+                        },
+                    });
+                }
+
+                return JSON.stringify(output);
+            })()
+            """
+        )
+
+        if not raw:
+            return []
+
+        if not isinstance(raw, str):
+            raise FeedExplorerError("Search DOM feed payload is not a JSON string.")
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise FeedExplorerError(f"Failed to parse search DOM feed JSON: {exc}") from exc
+
+        if not isinstance(parsed, list):
+            raise FeedExplorerError("Search DOM feed payload is not a list.")
         return parsed
 
 
@@ -725,6 +813,8 @@ class FeedExplorer:
                     self._apply_single_filter(value)
 
         feeds = self._extract_search_feeds()
+        if not feeds:
+            feeds = self._extract_search_feeds_from_dom()
         if feeds:
             return feeds
 
@@ -734,6 +824,8 @@ class FeedExplorer:
         while time.time() < deadline:
             self._sleep(0.6, minimum_seconds=0.2)
             feeds = self._extract_search_feeds()
+            if not feeds:
+                feeds = self._extract_search_feeds_from_dom()
             if feeds:
                 return feeds
         return feeds

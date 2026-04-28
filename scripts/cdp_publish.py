@@ -87,7 +87,6 @@ from feed_explorer import (
     FeedExplorerError,
     SearchFilters,
     make_feed_detail_url,
-    make_search_url,
 )
 from run_lock import SingleInstanceError, single_instance
 
@@ -547,8 +546,20 @@ class XiaohongshuPublisher:
             return pages[0]["webSocketDebuggerUrl"]
 
         # Create a new tab
+        ws_url = self._create_tab(XHS_CREATOR_URL)
+        if ws_url:
+            return ws_url
+
+        # Fallback: use first available page
+        if pages:
+            return pages[0]["webSocketDebuggerUrl"]
+
+        raise CDPError("No browser tabs available.")
+
+    def _create_tab(self, url: str) -> str:
+        """Create a new Chrome tab and return its WebSocket URL."""
         resp = requests.put(
-            f"http://{self.host}:{self.port}/json/new?{XHS_CREATOR_URL}",
+            f"http://{self.host}:{self.port}/json/new?{url}",
             timeout=5,
             proxies={"http": None, "https": None} if _is_local_host(self.host) else None,
         )
@@ -556,12 +567,46 @@ class XiaohongshuPublisher:
             ws_url = resp.json().get("webSocketDebuggerUrl", "")
             if ws_url:
                 return ws_url
+        return ""
 
-        # Fallback: use first available page
-        if pages:
-            return pages[0]["webSocketDebuggerUrl"]
+    def _current_target_id(self) -> str:
+        """Return the current CDP page target id parsed from the WebSocket URL."""
+        ws_url = getattr(self, "_ws_url", "") or ""
+        marker = "/devtools/page/"
+        if marker not in ws_url:
+            return ""
+        return ws_url.rsplit(marker, 1)[-1].strip()
 
-        raise CDPError("No browser tabs available.")
+    def _close_tab_by_id(self, target_id: str):
+        """Close a Chrome tab through the DevTools HTTP endpoint."""
+        if not target_id:
+            return
+        try:
+            requests.get(
+                f"http://{self.host}:{self.port}/json/close/{target_id}",
+                timeout=5,
+                proxies={"http": None, "https": None} if _is_local_host(self.host) else None,
+            )
+        except Exception as exc:
+            print(f"[cdp_publish] Warning: failed to close tab {target_id}: {exc}")
+
+    def _replace_current_tab(self, url: str):
+        """Close the current tab and reconnect to a fresh tab at the given URL."""
+        target_id = self._current_target_id()
+        if target_id:
+            print("[cdp_publish] Opening a fresh search tab and closing the previous tab...")
+
+        ws_url = self._create_tab(url)
+        if not ws_url:
+            raise CDPError(f"Could not create a new Chrome tab for {url}.")
+        self.disconnect()
+        self._close_tab_by_id(target_id)
+        self._sleep(0.8, minimum_seconds=0.3)
+
+        self._ws_url = ws_url
+        self._connect_ws(ws_url)
+        self._send("Page.enable")
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.0)
 
     def connect(self, target_url_prefix: str = "", reuse_existing_tab: bool = False):
         """Connect to a Chrome tab via WebSocket."""
@@ -1241,10 +1286,40 @@ class XiaohongshuPublisher:
         """)
         return bool(detected)
 
-    def _submit_search_via_input(self, keyword: str) -> bool:
-        """Type keyword into the search box and press Enter to search.
+    def _detail_or_comment_dom_visible(self) -> bool:
+        """Return True when a note detail view or its comment area is visible."""
+        visible = self._evaluate("""
+            (() => {
+                const selectors = [
+                    ".note-detail-mask",
+                    ".note-detail",
+                    "[class*='note-detail']",
+                    ".comments-container",
+                    "[class*='comments-container']",
+                    ".comment-item",
+                    ".parent-comment",
+                    "[class*='comment-item']",
+                    "[class*='parent-comment']",
+                ];
+                for (const selector of selectors) {
+                    const nodes = document.querySelectorAll(selector);
+                    for (const node of nodes) {
+                        if (!(node instanceof HTMLElement)) continue;
+                        const rect = node.getBoundingClientRect();
+                        if (rect.width > 20 && rect.height > 20) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            })()
+        """)
+        return bool(visible)
 
-        Returns True if the search input was found and submitted.
+    def _submit_search_via_input(self, keyword: str) -> dict[str, Any]:
+        """Type keyword into the search box and click the search icon.
+
+        Returns a structured result so callers can surface the exact failure reason.
         This simulates human search behavior and avoids anti-bot detection
         that triggers on direct URL navigation to search result pages.
         """
@@ -1269,21 +1344,56 @@ class XiaohongshuPublisher:
                     "[class*='search'] input",
                 ];
 
-                let inputEl = null;
-                for (const selector of selectors) {{
-                    const nodes = document.querySelectorAll(selector);
-                    for (const node of nodes) {{
-                        if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) continue;
-                        if (node.disabled || !isVisible(node)) continue;
-                        inputEl = node;
-                        break;
+                const findSearchInput = () => {{
+                    for (const selector of selectors) {{
+                        const nodes = document.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            if (!(node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)) continue;
+                            if (node.disabled || !isVisible(node)) continue;
+                            return node;
+                        }}
                     }}
-                    if (inputEl) break;
-                }}
+                    return null;
+                }};
 
+                let inputEl = null;
+                for (let i = 0; i < 30; i++) {{
+                    inputEl = findSearchInput();
+                    if (inputEl) break;
+                    await sleep(200);
+                }}
                 if (!inputEl) {{
                     return {{ ok: false, reason: "search_input_not_found" }};
                 }}
+
+                const findSearchIcon = () => {{
+                    const iconSelectors = [
+                        "div.search-icon",
+                        ".search-icon",
+                        "[class*='search-icon']",
+                        "svg use[href='#search']",
+                        "svg use[xlink\\\\:href='#search']",
+                    ];
+                    for (const selector of iconSelectors) {{
+                        const nodes = document.querySelectorAll(selector);
+                        for (const node of nodes) {{
+                            let el = node;
+                            if (!(el instanceof HTMLElement)) {{
+                                el = node.closest("div, button, a, span");
+                            }}
+                            if (!(el instanceof HTMLElement)) continue;
+                            if (!isVisible(el)) continue;
+                            const rect = el.getBoundingClientRect();
+                            return {{
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            }};
+                        }}
+                    }}
+                    return null;
+                }};
 
                 // Set value using React-compatible setter
                 const setValue = (value) => {{
@@ -1314,11 +1424,31 @@ class XiaohongshuPublisher:
                     await sleep(55 + Math.floor(Math.random() * 70));
                 }}
                 await sleep(220);
-                return {{ ok: true, reason: "" }};
+                let iconRect = null;
+                for (let i = 0; i < 15; i++) {{
+                    iconRect = findSearchIcon();
+                    if (iconRect) break;
+                    await sleep(120);
+                }}
+                if (!iconRect) {{
+                    return {{ ok: false, reason: "search_icon_not_found" }};
+                }}
+                return {{ ok: true, reason: "", iconRect }};
             }})()
         """)
         if not isinstance(result, dict):
             return {"ok": False, "reason": "unexpected_result"}
+
+        if result.get("ok"):
+            icon_rect = result.get("iconRect")
+            if not isinstance(icon_rect, dict):
+                return {"ok": False, "reason": "search_icon_rect_missing"}
+            cx = float(icon_rect["x"]) + float(icon_rect["width"]) / 2 + random.uniform(-2.0, 2.0)
+            cy = float(icon_rect["y"]) + float(icon_rect["height"]) / 2 + random.uniform(-2.0, 2.0)
+            self._move_mouse(cx, cy)
+            self._sleep(0.18, minimum_seconds=0.08)
+            self._click_mouse(cx, cy)
+
         reason = result.get("reason")
         return {
             "ok": bool(result.get("ok")),
@@ -1516,7 +1646,7 @@ class XiaohongshuPublisher:
         Returns:
             {
                 "keyword": str,
-                "recommended_keywords": list[str],  # dropdown related terms
+                "recommended_keywords": list[str],  # reserved; may be empty
                 "feeds": list[dict[str, Any]],      # extracted from __INITIAL_STATE__
             }
         """
@@ -1527,6 +1657,10 @@ class XiaohongshuPublisher:
         if not keyword:
             raise CDPError("Keyword cannot be empty.")
 
+        # Each keyword starts from a fresh tab. This avoids stale search state and
+        # prevents direct search_result URL navigation from tripping risk controls.
+        self._replace_current_tab(XHS_HOME_URL)
+
         # Clear __INITIAL_STATE__ first so that if the new page takes time to load,
         # we do not accidentally read the old page's data.
         try:
@@ -1534,12 +1668,14 @@ class XiaohongshuPublisher:
         except Exception:
             pass
 
-        # Navigate directly to the keyword search URL to avoid a double
-        # page load (the old flow navigated to SEARCH_BASE_URL first, then
-        # again with keyword — triggering "请求太频繁" rate limits).
-        search_url = make_search_url(keyword)
-        self._navigate(search_url)
-        self._sleep(2, minimum_seconds=1.5)
+        submit_result = self._submit_search_via_input(keyword)
+        if not submit_result.get("ok"):
+            reason = submit_result.get("reason") or "search_submit_failed"
+            raise CDPError(f"Search submit failed via input. reason={reason}")
+        self._sleep(2.5, minimum_seconds=1.5)
+
+        if self._detect_rate_limit_page():
+            raise CDPError("Search triggered a Xiaohongshu rate-limit/security page.")
 
         explorer = FeedExplorer(
             self._evaluate,
@@ -1548,24 +1684,7 @@ class XiaohongshuPublisher:
             click_mouse=self._click_mouse,
         )
 
-        # Try to capture search recommendations from the current page.
-        # This only works if the search input is present (it should be
-        # since we already loaded the search results page).
         recommended_keywords: list[str] = []
-        try:
-            recommendation_result = self._capture_search_recommendations_via_network(
-                keyword=keyword, wait_seconds=10.0,
-            )
-            recommended_keywords = recommendation_result.get("suggestions", [])
-            if not recommendation_result.get("ok"):
-                # Non-critical — just log and continue
-                reason = recommendation_result.get("reason") or "recommend_api_failed"
-                print(
-                    "[cdp_publish] Warning: search recommendations unavailable. "
-                    f"reason={reason}"
-                )
-        except Exception:
-            pass
 
         try:
             feeds = explorer.search_feeds(keyword=keyword, filters=filters)
@@ -2519,18 +2638,27 @@ class XiaohongshuPublisher:
         content = content.strip()
         if not feed_id:
             raise CDPError("feed_id cannot be empty.")
-        if not xsec_token:
-            raise CDPError("xsec_token cannot be empty.")
         if not content:
             raise CDPError("content cannot be empty.")
 
+        current_url = str(self._evaluate("window.location.href") or "")
         if not skip_navigation:
-            current_url = str(self._evaluate("window.location.href") or "")
             if feed_id not in current_url:
+                if not xsec_token:
+                    raise CDPError("xsec_token cannot be empty when navigation is required.")
                 detail_url = make_feed_detail_url(feed_id, xsec_token)
                 self._navigate(detail_url)
                 self._sleep(2, minimum_seconds=1.0)
                 self._check_feed_page_accessible()
+        elif feed_id not in current_url and not self._detail_or_comment_dom_visible():
+            if not xsec_token:
+                raise CDPError(
+                    "xsec_token cannot be empty because current page is not the target detail view."
+                )
+            detail_url = make_feed_detail_url(feed_id, xsec_token)
+            self._navigate(detail_url)
+            self._sleep(2, minimum_seconds=1.0)
+            self._check_feed_page_accessible()
 
         target_result = self._activate_reply_target_for_comment(
             comment_id=comment_id,

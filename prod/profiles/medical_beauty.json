@@ -1,0 +1,51 @@
+{
+    "service_name": "医美服务（脱毛,皮肤清洁，皮肤补水，修丽可水疗）",
+    "service_desc": "提供正规医美机构一对一咨询与项目预约服务，涵盖翠绿宝石脱毛，脱毛，赛诺龙脱毛，悬浮脱毛,皮肤清洁，皮肤补水，修丽可水疗等热门抗衰与皮肤管理项目，专业团队面诊，透明报价、效果可见。",
+    "llm_keyword_topic": "脱毛,皮肤清洁，皮肤补水，修丽可水疗",
+    "llm_intent_terms": "脱毛,皮肤清洁，皮肤补水，修丽可水疗",
+    "llm_system_role": "You are a professional medical aesthetic consultant. You analyze Chinese social media comments and generate natural, concise replies that invite potential customers to DM for consultation, facial assessment or project booking.",
+    "llm_reply_style": "像真实小红书美女博主,温柔、专业、真诚",
+    "llm_reply_max_chars": 50,
+    "llm_model": "google/gemini-3-flash-preview",
+    "config": {
+        "keywords_count": 10,
+        "placeholder_count": 3,
+        "llm_keyword_batch_size": 20,
+        "min_comment_count": 5,
+        "analyze_comment_count": 10,
+        "post_per_keyword": 3,
+        "keyword_delay_min": 8,
+        "keyword_delay_max": 15,
+        "post_delay_min": 2,
+        "post_delay_max": 5,
+        "round_delay_min": 15,
+        "round_delay_max": 30
+    },
+    "keywords": {
+        "special_keywords": [
+            "{city}翠绿宝石脱毛",
+            "{city}赛诺龙脱毛",
+            "{city}悬浮脱毛"
+        ],
+        "general_keywords": [
+            "翠绿宝石脱毛",
+            "赛诺龙脱毛",
+            "悬浮脱毛",
+            "皮肤清洁",
+            "皮肤补水",
+            "修丽可水疗"
+        ],
+        "placeholders": {
+            "city": [
+                "福州"
+            ],
+            "project": [],
+            "concern": []
+        },
+        "placeholder_counts": {
+            "city": 3,
+            "project": 3,
+            "concern": 3
+        }
+    }
+}

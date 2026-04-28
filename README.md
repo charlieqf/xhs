@@ -210,7 +210,10 @@ python scripts/cdp_publish.py notes-from-profile --user-id USER_ID --limit 20 --
 python scripts/cdp_publish.py get-notification-mentions
 ```
 
-说明：`list-feeds` 返回首页推荐 feed 列表；`search-feeds` 会先在搜索框输入关键词，抓取下拉推荐词（`recommended_keywords`），再回车拉取 feed 列表。
+说明：`list-feeds` 返回首页推荐 feed 列表；`search-feeds` 每个关键词都会切换到新的小红书首页标签页并关闭旧搜索标签页，再通过搜索框输入关键词并点击搜索图标拉取 feed 列表，避免直接跳转搜索 URL 触发风控或关键词切换异常。
+说明：若搜索结果页没有刷新 `window.__INITIAL_STATE__`，脚本会从已渲染的结果卡片 DOM 兜底提取笔记 ID 与 `xsec_token`；此时列表页评论数可能显示为未知，机器人会打开详情后再校验真实可见评论数。
+说明：评论机器人打开笔记后会兼容详情页浮层，若详情 state 未刷新，会以详情/评论 DOM 可见作为加载成功，并滚动到评论区后提取评论。
+说明：评论机器人在已打开的详情浮层内回复时，会直接使用当前页面上下文；只有需要重新导航详情页时才强制要求 `xsec_token`。
 说明：`get-feed-detail --load-all-comments` 会在详情页滚动评论区，并可选点击“更多回复”后再提取 `window.__INITIAL_STATE__`。
 
 ### 6. 获取内容数据表（content_data）
@@ -336,7 +339,7 @@ python scripts/cdp_publish.py switch-account
 说明：`list-feeds`、`search-feeds`、`get-feed-detail`、`post-comment-to-feed`、`respond-comment`、`note-upvote`、`note-unvote`、`note-bookmark`、`note-unbookmark`、`profile-snapshot`、`notes-from-profile` 与 `get-notification-mentions` 会校验 `xiaohongshu.com` 主页登录态（非创作者中心登录态）。
 说明：登录态检查默认启用本地缓存（12 小时，仅缓存“已登录”结果），到期后自动重新走网页校验。
 说明：`get-login-qrcode` 返回 `qrcode_base64` / `qrcode_data_url`，便于远程前端直接展示扫码。
-说明：`search-feeds` 输出新增 `recommended_keywords_count` 与 `recommended_keywords` 字段，表示输入关键词后回车前的下拉推荐词。
+说明：`search-feeds` 输出保留 `recommended_keywords_count` 与 `recommended_keywords` 字段；当前搜索流程优先使用输入框 + 搜索图标提交，推荐词字段可能为空。
 说明：`get-feed-detail --load-all-comments` 额外返回 `comment_loading`，用于说明评论滚动加载结果。
 说明：`content-data` 会校验创作者中心登录态，并抓取 `statistics/data-analysis` 页面中的笔记基础信息表。
 
@@ -374,6 +377,7 @@ python scripts/chrome_launcher.py --kill
 ### 7. 评论截流机器人
 
 基于关键词自动搜索笔记并回复有相亲意向的评论。
+通用版机器人 `prod/general_comment_bot.py <profile>` 会优先使用 LLM 生成搜索关键词；如果 LLM 不可用或生成失败，则自动回退到 profile 中的静态关键词库，并在日志中展示真实来源。
 
 ```bash
 # 确保 Chrome 已启动并登录

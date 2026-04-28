@@ -1,12 +1,21 @@
 """
-生产版 - 小红书评论自动回复机器人
+生产版 - 小红书评论自动回复机器人（通用版）
 
-基于关键词搜索笔记，通过 LLM 分析评论意向，自动回复最有相亲服务意向的评论。
+与 comment_bot.py 的区别：
+- 服务相关配置（关键词、占位符池、服务描述、LLM 提示语等）全部抽离到
+  prod/profiles/<profile>.json 配置文件中。
+- 通过命令行指定 profile 名称即可切换不同业务领域。
 
 用法:
-    python prod/comment_bot.py
+    python prod/general_comment_bot.py <profile_name>
+
+示例:
+    python prod/general_comment_bot.py drone           # 无人机服务
+    python prod/general_comment_bot.py medical_beauty  # 医美服务
+    python prod/general_comment_bot.py dating          # 婚恋服务
 """
 
+import argparse
 import sys
 import os
 import json
@@ -40,22 +49,29 @@ OPENROUTER_API_KEY = (
     or os.environ.get("api_key", "")
 )
 
+PROFILES_DIR = os.path.join(script_dir, "profiles")
+
 
 # ============================================================
-#  配置加载
+#  Profile 加载
 # ============================================================
 
-def load_config() -> dict:
-    """加载 prod/config.json 配置。"""
-    config_path = os.path.join(script_dir, "config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_keywords() -> dict:
-    """加载 prod/keywords.json 关键词数据。"""
-    keywords_path = os.path.join(script_dir, "keywords.json")
-    with open(keywords_path, "r", encoding="utf-8") as f:
+def load_profile(profile_name: str) -> dict:
+    """加载 prod/profiles/<profile_name>.json 配置文件。"""
+    profile_path = os.path.join(PROFILES_DIR, f"{profile_name}.json")
+    if not os.path.exists(profile_path):
+        available = []
+        if os.path.isdir(PROFILES_DIR):
+            available = [
+                os.path.splitext(f)[0]
+                for f in os.listdir(PROFILES_DIR)
+                if f.endswith(".json")
+            ]
+        raise FileNotFoundError(
+            f"找不到 profile 文件: {profile_path}\n"
+            f"可用 profile: {available}"
+        )
+    with open(profile_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -67,41 +83,43 @@ def load_keywords() -> dict:
 _used_keywords_history: set[str] = set()
 
 
-def generate_keywords(config: dict, keywords_data: dict) -> list[str]:
+def generate_keywords(profile: dict) -> list[str]:
     """
-    根据配置展开 special_keywords 并随机抽取 general_keywords，
-    合并后打乱顺序返回。跳过已使用过的关键词。
+    根据 profile 展开 special_keywords（支持任意占位符）
+    并从 general_keywords 中随机抽取，合并后打乱顺序返回。
+    跳过已使用过的关键词。
     """
-    special_templates = keywords_data.get("special_keywords", [])
-    general_pool = keywords_data.get("general_keywords", [])
-    cities = keywords_data.get("city", [])
-    platforms = keywords_data.get("platform", [])
-    sports = keywords_data.get("sports", [])
+    keywords_data = profile.get("keywords", {})
+    config = profile.get("config", {})
 
-    city_count = config.get("city_count", 3)
-    platform_count = config.get("platform_count", 3)
-    sports_count = config.get("sports_count", 3)
+    special_templates: list[str] = keywords_data.get("special_keywords", [])
+    general_pool: list[str] = keywords_data.get("general_keywords", [])
+    placeholders: dict[str, list[str]] = keywords_data.get("placeholders", {})
+    placeholder_counts: dict[str, int] = keywords_data.get("placeholder_counts", {})
+
     keywords_count = config.get("keywords_count", 10)
+    default_placeholder_count = config.get("placeholder_count", 3)
 
-    # --- A: 展开 special_keywords ---
+    # --- A: 展开 special_keywords（支持多占位符） ---
     expanded: list[str] = []
+    placeholder_pattern = re.compile(r"\{(\w+)\}")
 
     for template in special_templates:
-        if "{city}" in template:
-            sampled = random.sample(cities, min(city_count, len(cities)))
-            for city in sampled:
-                expanded.append(template.replace("{city}", city))
-        elif "{platform}" in template:
-            sampled = random.sample(platforms, min(platform_count, len(platforms)))
-            for platform in sampled:
-                expanded.append(template.replace("{platform}", platform))
-        elif "{sports}" in template:
-            sampled = random.sample(sports, min(sports_count, len(sports)))
-            for sport in sampled:
-                expanded.append(template.replace("{sports}", sport))
-        else:
-            # 不含占位符的 special 关键词直接加入
+        names = placeholder_pattern.findall(template)
+        if not names:
             expanded.append(template)
+            continue
+
+        # 目前支持模板中最多一个占位符（与原实现一致）
+        primary = names[0]
+        pool = placeholders.get(primary, [])
+        if not pool:
+            continue
+
+        count = placeholder_counts.get(primary, default_placeholder_count)
+        sampled = random.sample(pool, min(count, len(pool)))
+        for value in sampled:
+            expanded.append(template.replace("{" + primary + "}", value))
 
     # --- B: 从 general_keywords 随机抽取 ---
     general_sampled = random.sample(
@@ -120,35 +138,32 @@ def generate_keywords(config: dict, keywords_data: dict) -> list[str]:
             seen.add(kw)
             unique.append(kw)
 
-    # 记录本轮关键词到历史
     _used_keywords_history.update(unique)
-
     return unique
 
 
 def generate_keywords_with_llm(
-    config: dict,
-    keywords_data: dict,
+    profile: dict,
     batch_size: int = 20,
 ) -> list[str]:
-    """
-    调用 LLM 根据现有关键词库的风格，生成一批全新的搜索关键词。
-    这些关键词会避开历史已使用过的词，确保每轮搜索都能覆盖新内容。
-    """
+    """调用 LLM 根据 profile 描述的业务生成一批全新的搜索关键词。"""
     if not OPENROUTER_API_KEY:
         print("  -> [警告] 未设置 API Key，无法使用 LLM 生成关键词。")
         return []
 
-    # 从现有关键词库中随机抽取样本作为参考
+    keywords_data = profile.get("keywords", {})
     all_existing = keywords_data.get("general_keywords", [])
     sample_size = min(15, len(all_existing))
     sample_keywords = random.sample(all_existing, sample_size) if all_existing else []
 
-    # 准备已用关键词列表（取最近的部分避免 prompt 过长）
     recent_used = list(_used_keywords_history)[-60:]
 
+    business_name = profile.get("service_name", "")
+    business_topic = profile.get("llm_keyword_topic", business_name)
+    intent_terms = profile.get("llm_intent_terms", business_name)
+
     prompt = (
-        f"你是一个小红书营销关键词生成专家。我们的业务是相亲交友/脱单服务。\n"
+        f"你是一个小红书营销关键词生成专家。我们的业务是{business_topic}。\n"
         f"\n"
         f"请基于以下参考关键词的风格和主题，生成 {batch_size} 个全新的小红书搜索关键词。\n"
         f"\n"
@@ -160,11 +175,11 @@ def generate_keywords_with_llm(
         f"\n"
         f"生成要求：\n"
         f"1. 关键词必须是小红书用户真实会搜索的内容\n"
-        f"2. 覆盖多个角度：情感痛点、场景需求、年龄段、职业、城市、兴趣社交等\n"
+        f"2. 覆盖多个角度：痛点、场景需求、人群、地域（限制在福州）、价格、测评、兴趣等\n"
         f"3. 包含长尾关键词（3-8个字）和短关键词（2-4个字）混合\n"
-        f"4. 可以包含口语化、情绪化的表达（如'好想脱单啊'、'单身久了会怎样'）\n"
-        f"5. 可以蹭热点话题、节日、季节相关（如'春天脱单计划'、'520前脱单'）\n"
-        f"6. 每个关键词都要跟 相亲/交友/脱单/恋爱/婚恋 相关\n"
+        f"4. 可以包含口语化、情绪化的表达\n"
+        f"5. 可以蹭热点话题、节日、季节相关\n"
+        f"6. 每个关键词都要跟 {intent_terms} 相关\n"
         f"7. 不要带编号和引号\n"
         f"\n"
         f'请严格按以下JSON格式返回（不要返回除JSON以外的任何内容）：\n'
@@ -179,7 +194,7 @@ def generate_keywords_with_llm(
         "Content-Type": "application/json",
     }
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": profile.get("llm_model", "google/gemini-3-flash-preview"),
         "messages": [
             {
                 "role": "system",
@@ -192,6 +207,7 @@ def generate_keywords_with_llm(
         ],
     }
 
+    content_text = ""
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
@@ -206,7 +222,6 @@ def generate_keywords_with_llm(
 
         raw_keywords = result.get("keywords", [])
 
-        # 过滤已用关键词
         fresh: list[str] = []
         for kw in raw_keywords:
             kw = kw.strip()
@@ -225,55 +240,58 @@ def generate_keywords_with_llm(
         return []
 
 
-def get_next_keyword_batch(
-    config: dict,
-    keywords_data: dict,
-    round_number: int,
-) -> list[str]:
+def get_next_keyword_batch(profile: dict, round_number: int) -> tuple[list[str], str]:
     """
     智能获取下一批关键词：
-    - 第1轮：使用 keywords.json 中的静态关键词
-    - 第2轮开始：优先用 LLM 生成新词，不够时回退到静态关键词（重置历史允许复用）
-    """
-    if round_number == 1:
-        # 第一轮：使用静态关键词
-        return generate_keywords(config, keywords_data)
+    - 所有轮次：优先用 LLM 生成新词
+    - LLM 失败或未返回关键词时，回退到 profile 中的静态关键词
 
-    # 后续轮次：LLM 生成
+    返回：
+    - keywords: 本轮关键词
+    - source: 实际来源，用于日志展示
+    """
+    _ = round_number  # 保留参数便于日志和后续按轮次扩展策略
+    config = profile.get("config", {})
     batch_size = config.get("llm_keyword_batch_size", 20)
-    llm_keywords = generate_keywords_with_llm(config, keywords_data, batch_size)
+    llm_keywords = generate_keywords_with_llm(profile, batch_size)
 
     if llm_keywords:
         random.shuffle(llm_keywords)
-        return llm_keywords
+        return llm_keywords, "LLM 智能生成"
 
-    # LLM 失败时回退：清除历史，重新使用静态关键词
     print("  -> [回退] LLM 生成失败，清除历史重新使用静态关键词...")
     _used_keywords_history.clear()
-    return generate_keywords(config, keywords_data)
+    return generate_keywords(profile), "静态关键词库（LLM 回退）"
 
 
 # ============================================================
 #  LLM 评论分析
 # ============================================================
 
-SERVICE_DESC = (
-    "为单身人群提供真诚靠谱的脱单交友服务，"
-    "精准匹配同频对象，拓展社交圈，"
-    "告别无效相亲与低效尬聊。"
-)
-
-
 def evaluate_comments_with_llm(
+    profile: dict,
     comments: list[dict],
 ) -> dict | None:
     """
-    将评论发送给 LLM 分析，判断哪条最有相亲意向。
+    将评论发送给 LLM 分析，判断哪条最有业务意向。
     无意向时返回 selected_index = -1。
     """
     if not OPENROUTER_API_KEY:
         print("  -> [警告] 未设置 OPENROUTER_API_KEY / api_key，跳过 LLM 分析。")
         return None
+
+    service_desc = profile.get("service_desc", "")
+    intent_terms = profile.get("llm_intent_terms", "相关服务")
+    reply_style = profile.get(
+        "llm_reply_style",
+        "像真实小红书用户，友好、真诚、有网感",
+    )
+    reply_max_chars = profile.get("llm_reply_max_chars", 50)
+    system_role = profile.get(
+        "llm_system_role",
+        "You are a helpful marketing assistant that analyzes comments and "
+        "generates natural, concise Chinese replies.",
+    )
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
@@ -281,7 +299,6 @@ def evaluate_comments_with_llm(
         "Content-Type": "application/json",
     }
 
-    # 构建评论文本
     comments_text = ""
     for i, c in enumerate(comments):
         user = c.get("userInfo", {}).get("nickname", "Unknown")
@@ -291,15 +308,22 @@ def evaluate_comments_with_llm(
     prompt = f"""
 请分析以下来自小红书帖子的评论。
 你的任务是：
-1. 判断哪一条评论的用户表现出了最强烈的相亲/交友/脱单意向（有找对象的潜在需求）。
-2. 如果没有任何评论有相亲/交友意向，请返回 selected_index 为 -1。
-3. 如果有意向，针对最有意向的评论生成一条回复。
-4. 回复核心目的：自然地邀请对方发私信了解我们的服务。
-5. 服务介绍（可适当缩写）：「{SERVICE_DESC}」
+1. 判断哪一条评论的用户表现出了最强烈的 {intent_terms} 意向（有潜在需求）。
+2. 如果没有任何评论有 {intent_terms} 意向，请返回 selected_index 为 -1。
+3. 如果有意向,针对最有意向的评论生成一条回复。
+4. 回复核心目的：口语化的真诚地跟对方分享ta关心问题的解决方案，不要在回复中体现任何广告/商业目的，回复要遵守“真诚分享，友好互动”的小红书社区价值观。
+5. 服务介绍（可适当缩写）：「{service_desc}」
 6. 回复要求：
-   - 像真实小红书用户，友好、真诚、有网感
-   - 字数严格控制在50字以内
+   - {reply_style}
+   - 字数严格控制在{reply_max_chars}字以内
    - 不要使用 emoji 表情
+   - 不要邀请对方发私信，或者让对方查看主页等操作
+   - 用短句，体现口语化特点
+   - 加上噢，啦，呢，这样的语气词，尽量不要用句号
+7. 场景1，如果对方表达了脱毛需求，但不知道最佳实践，可以的回复示例：翠绿宝石属实属于天花板了，其他激光也 OK就是时间长一点。翠绿宝石自带冷喷舒适度比较高。但话说回来，主包说的是非常真实的，而且特别不建议用脱毛膏或者是子去拔还有家用脱毛仪(超自律手工活力党当我没说。有说就是你对。)
+8. 场景2，如果对方有用过翠绿宝石脱毛，可以用类似的方式回复："确实，脱毛还得是翠绿宝石"/"真的，做过翠绿宝石脱毛的都知道有多香"/"翠绿宝石做三次就少很多多多了"/"翠绿宝石脱毛机构舍得冷媒开够量，真的不疼"/"翠绿宝石脱毛做一次顶三次啊"/"悬浮脱毛不接触皮肤，有冷喷体验感好"/"翠绿宝石是悬浮脱毛，不接触皮肤，拒绝交叉感染"
+9. 其他场景采用类似的回复话术。
+
 
 评论列表：
 {comments_text}
@@ -313,27 +337,20 @@ def evaluate_comments_with_llm(
 """
 
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": profile.get("llm_model", "google/gemini-3-flash-preview"),
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a highly emotionally intelligent matchmaking "
-                    "service assistant. You analyze comments and generate "
-                    "natural, concise Chinese replies."
-                ),
-            },
+            {"role": "system", "content": system_role},
             {"role": "user", "content": prompt},
         ],
     }
 
+    content_text = ""
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         content_text = data["choices"][0]["message"]["content"]
 
-        # 尝试提取 JSON
         match = re.search(r"\{.*\}", content_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
@@ -350,26 +367,26 @@ def evaluate_comments_with_llm(
 
 
 # ============================================================
-#  缓存工具 - 在 prod/ 目录下持久化
+#  缓存工具 - 基于 profile 独立文件
 # ============================================================
 
-CACHE_FILE = os.path.join(script_dir, "processed_cache.json")
+def get_cache_file(profile_name: str) -> str:
+    return os.path.join(script_dir, f"processed_cache_{profile_name}.json")
 
 
-def load_cache() -> dict:
-    """加载已处理记录缓存。"""
-    if os.path.exists(CACHE_FILE):
+def load_cache(profile_name: str) -> dict:
+    path = get_cache_file(profile_name)
+    if os.path.exists(path):
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
             pass
     return {}
 
 
-def save_cache(cache: dict):
-    """持久化缓存到磁盘。"""
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+def save_cache(profile_name: str, cache: dict):
+    with open(get_cache_file(profile_name), "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
@@ -384,20 +401,15 @@ def _scroll_search_page(publisher: XiaohongshuPublisher, pixels: int = 600):
 
 
 def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
-    """
-    检查 feed_id 对应的**可点击卡片**是否存在于当前 DOM 中。
-    只匹配真正可点击的元素，避免 textContent 误匹配隐藏 JSON 等。
-    """
+    """检查 feed_id 对应的可点击卡片是否存在于当前 DOM 中。"""
     return bool(publisher._evaluate(f"""
         (() => {{
             const feedId = "{feed_id}";
-            // 1. 检查 <a> 标签 href 包含 feedId（最可靠）
             const links = document.querySelectorAll('a[href*="' + feedId + '"]');
             for (const link of links) {{
                 const rect = link.getBoundingClientRect();
                 if (rect.width > 0 && rect.height > 0) return true;
             }}
-            // 2. 检查带 data 属性的元素
             const dataEls = document.querySelectorAll(
                 '[data-note-id="' + feedId + '"], ' +
                 '[data-feed-id="' + feedId + '"], ' +
@@ -413,42 +425,12 @@ def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
     """))
 
 
-def _get_card_element_js(feed_id: str) -> str:
-    """
-    返回一段 JS 表达式，用于查找并返回目标卡片的可点击 <a> 元素。
-    兼容多种 DOM 结构，优先返回可见且尺寸合理的元素。
-    """
-    return f"""
-        (() => {{
-            const feedId = "{feed_id}";
-            const links = document.querySelectorAll('a');
-            for (const link of links) {{
-                if (!link.href || !link.href.includes(feedId)) continue;
-                const rect = link.getBoundingClientRect();
-                // 元素必须可见且尺寸合理
-                if (rect.width > 20 && rect.height > 20) {{
-                    return link;
-                }}
-            }}
-            return null;
-        }})()
-    """
-
-
 def click_note_card(
     publisher: XiaohongshuPublisher,
     feed_id: str,
     feed_index: int = 0,
 ) -> bool:
-    """
-    在搜索结果页中，通过 CDP 鼠标点击指定 feed_id 的笔记卡片封面。
-    增强版：预滚动 + 多轮滚动查找 + 多种 DOM 选择器 + 点击重试。
-
-    Args:
-        feed_index: 当前笔记在列表中的序号（0-based），用于估算预滚动距离。
-    """
-    # 阶段 0：如果卡片不在 DOM 中，根据序号预滚动到大致位置
-    #         每张卡片大约占 280px 高度（双列布局，每行2张，约560px/2）
+    """通过 CDP 鼠标点击指定 feed_id 的笔记卡片封面。"""
     if not _find_card_in_dom(publisher, feed_id) and feed_index > 0:
         estimated_y = (feed_index // 2) * 280
         publisher._evaluate(
@@ -456,35 +438,30 @@ def click_note_card(
         )
         publisher._sleep(1.5, minimum_seconds=0.8)
 
-    # 阶段 1：如果卡片仍不在 DOM 中，逐步向下滚动触发懒加载
     max_scroll_attempts = 10
     if not _find_card_in_dom(publisher, feed_id):
-        for attempt in range(max_scroll_attempts):
+        for _ in range(max_scroll_attempts):
             _scroll_search_page(publisher, pixels=500)
             if _find_card_in_dom(publisher, feed_id):
                 break
         else:
-            # 向下搜索失败，滚回顶部做一次全量向下搜索
             publisher._evaluate("window.scrollTo({ top: 0, behavior: 'instant' });")
             publisher._sleep(1.5, minimum_seconds=0.8)
-            for attempt in range(max_scroll_attempts):
+            for _ in range(max_scroll_attempts):
                 if _find_card_in_dom(publisher, feed_id):
                     break
                 _scroll_search_page(publisher, pixels=500)
             else:
                 return False
 
-    # 阶段 2：滚动到卡片可视区域（使用 instant 避免 smooth 动画延迟）
     scroll_ok = publisher._evaluate(f"""
         (() => {{
             const feedId = "{feed_id}";
-            // 优先通过 href 精确匹配 <a> 标签
             const links = document.querySelectorAll('a[href*="' + feedId + '"]');
             for (const link of links) {{
                 link.scrollIntoView({{ behavior: 'instant', block: 'center' }});
                 return true;
             }}
-            // fallback: data 属性匹配
             const dataEls = document.querySelectorAll(
                 '[data-note-id="' + feedId + '"], ' +
                 '[data-feed-id="' + feedId + '"]'
@@ -500,25 +477,19 @@ def click_note_card(
         return False
     publisher._sleep(1.5, minimum_seconds=0.8)
 
-    # 阶段 3：获取卡片矩形并点击（带重试）
     for retry in range(3):
         rect_js = f"""
             (() => {{
                 const feedId = "{feed_id}";
-                
-                // 优先检查 <a> 标签
                 const links = document.querySelectorAll('a');
                 for (const link of links) {{
                     if (!link.href || !link.href.includes(feedId)) continue;
                     const rect = link.getBoundingClientRect();
-                    // 放宽视口限制：只要元素部分可见即可
                     if (rect.width > 20 && rect.height > 20 &&
                         rect.bottom > 0 && rect.top < window.innerHeight) {{
                         return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
                     }}
                 }}
-                
-                // fallback: 检查 data-* 属性
                 const dataEls = document.querySelectorAll(
                     '[data-note-id="' + feedId + '"], ' +
                     '[data-feed-id="' + feedId + '"], ' +
@@ -532,7 +503,6 @@ def click_note_card(
                         return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
                     }}
                 }}
-                
                 return null;
             }})()
         """
@@ -543,7 +513,6 @@ def click_note_card(
             if retry < 2:
                 print(f"    -> [调试] CDP 点击卡片失败（重试 {retry + 1}/2）: {e}")
                 publisher._sleep(1.0, minimum_seconds=0.5)
-                # 重新滚动确保卡片在视口中
                 publisher._evaluate(f"""
                     (() => {{
                         const feedId = "{feed_id}";
@@ -561,33 +530,6 @@ def click_note_card(
             else:
                 print(f"    -> [调试] CDP 点击卡片失败: {e}")
                 return False
-
-
-def open_note_by_url(
-    publisher: XiaohongshuPublisher,
-    feed_id: str,
-    xsec_token: str,
-) -> bool:
-    """
-    直接通过 URL 导航到笔记详情页（卡片点击失败时的后备方案）。
-    返回是否成功加载详情页。
-    """
-    from feed_explorer import make_feed_detail_url
-
-    if not xsec_token:
-        print("    -> [调试] 无 xsec_token，无法构造详情 URL。")
-        return False
-
-    try:
-        detail_url = make_feed_detail_url(feed_id, xsec_token)
-    except Exception as e:
-        print(f"    -> [调试] 构造详情 URL 失败: {e}")
-        return False
-
-    print(f"    -> 使用 URL 直接导航到笔记详情页...")
-    publisher._navigate(detail_url)
-    publisher._sleep(2.5, minimum_seconds=1.5)
-    return True
 
 
 def wait_for_detail_state(
@@ -747,13 +689,22 @@ def parse_comment_count(count_str: str) -> int:
 
 
 # ============================================================
-#  主流程
+#  结果保存
 # ============================================================
 
-def _save_results(all_responses: list[dict], total_replies: int, total_skipped: int, round_number: int, is_final: bool = False):
+def _save_results(
+    profile_name: str,
+    all_responses: list[dict],
+    total_replies: int,
+    total_skipped: int,
+    round_number: int,
+    is_final: bool = False,
+):
     """保存当前累计的回复结果到 JSON 文件。"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(script_dir, f"comment_responses_{timestamp}.json")
+    result_file = os.path.join(
+        script_dir, f"comment_responses_{profile_name}_{timestamp}.json"
+    )
 
     label = "最终" if is_final else f"第{round_number}轮"
     print(f"\n{'=' * 60}")
@@ -767,16 +718,44 @@ def _save_results(all_responses: list[dict], total_replies: int, total_skipped: 
         json.dump(all_responses, f, ensure_ascii=False, indent=2)
 
 
+# ============================================================
+#  主流程
+# ============================================================
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="小红书评论自动回复机器人（通用版）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  python prod/general_comment_bot.py drone\n"
+            "  python prod/general_comment_bot.py medical_beauty\n"
+        ),
+    )
+    parser.add_argument(
+        "profile",
+        help="profile 名称（对应 prod/profiles/<profile>.json）",
+    )
+    args = parser.parse_args()
+    profile_name = args.profile
+
+    # --- 加载 profile ---
+    try:
+        profile = load_profile(profile_name)
+    except FileNotFoundError as e:
+        print(f"[错误] {e}")
+        sys.exit(1)
+
+    service_name = profile.get("service_name", profile_name)
+
     print("=" * 60)
-    print("  小红书评论自动回复机器人 (生产版 · 无限模式)")
+    print(f"  小红书评论自动回复机器人 (通用版 · 无限模式)")
+    print(f"  当前业务: {service_name} [profile={profile_name}]")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
 
-    # --- 加载配置 ---
-    config = load_config()
-    keywords_data = load_keywords()
-
+    # --- 读取配置 ---
+    config = profile.get("config", {})
     min_comment_count = config.get("min_comment_count", 5)
     analyze_comment_count = config.get("analyze_comment_count", 10)
     post_per_keyword = config.get("post_per_keyword", 10)
@@ -804,10 +783,9 @@ def main():
     print("[初始化] 登录状态正常 ✓\n")
 
     # --- 加载缓存 ---
-    cache = load_cache()
-    print(f"[缓存] 已加载 {len(cache)} 条历史处理记录。\n")
+    cache = load_cache(profile_name)
+    print(f"[缓存] 已加载 {len(cache)} 条历史处理记录 (profile={profile_name})。\n")
 
-    # --- 无限循环 ---
     all_responses: list[dict] = []
     total_replies = 0
     total_skipped = 0
@@ -817,24 +795,21 @@ def main():
         while True:
             round_number += 1
 
-            # --- 生成本轮关键词 ---
             print(f"\n{'━' * 60}")
             print(f"  🔄 第 {round_number} 轮关键词生成")
             print(f"{'━' * 60}")
 
-            keywords = get_next_keyword_batch(config, keywords_data, round_number)
+            keywords, source = get_next_keyword_batch(profile, round_number)
 
             if not keywords:
                 print("  -> [警告] 未生成任何关键词，等待后重试...")
                 time.sleep(random.uniform(10, 20))
                 continue
 
-            source = "静态关键词库" if round_number == 1 else "LLM 智能生成"
             print(f"\n[关键词] 来源: {source}，共 {len(keywords)} 个：")
             for i, kw in enumerate(keywords, 1):
                 print(f"  {i:3d}. {kw}")
 
-            # --- 遍历关键词 ---
             for kw_idx, keyword in enumerate(keywords, start=1):
                 print(f"\n{'─' * 50}")
                 print(f"[第{round_number}轮 {kw_idx}/{len(keywords)}] 🔍 搜索关键词: 「{keyword}」")
@@ -843,7 +818,6 @@ def main():
                 try:
                     search_results = publisher.search_feeds(keyword=keyword)
                 except Exception as e:
-                    # 连接断开时尝试重连一次再搜索
                     err_msg = str(e).lower()
                     if any(k in err_msg for k in ("closed", "keepalive", "ping", "websocket", "1011")):
                         print(f"  -> [警告] WebSocket 连接断开 ({e})，尝试重连...")
@@ -875,14 +849,12 @@ def main():
 
                     print(f"  [{feed_idx}/{len(top_feeds)}] 📝 {title} (ID: {feed_id})")
 
-                    # 检查缓存
                     if feed_id and feed_id in cache:
                         processed_at = cache[feed_id].get("processed_at", "未知")
                         print(f"    -> [跳过] 已于 {processed_at} 处理过。")
                         total_skipped += 1
                         continue
 
-                    # 检查评论数门槛
                     comment_count_str = str(
                         feed.get("noteCard", {})
                         .get("interactInfo", {})
@@ -909,11 +881,7 @@ def main():
                         f"正在打开笔记详情..."
                     )
 
-                    # 记录是否通过直接 URL 导航（用于后续正确返回）
-                    opened_via_url = False
-
                     try:
-                        # 1. 尝试点击笔记卡片（快速，保持在搜索页上下文）
                         if not click_note_card(publisher, feed_id, feed_index=feed_idx - 1):
                             print("    -> 笔记卡片初次点击失败。尝试向下翻页并重试...")
                             _scroll_search_page(publisher, pixels=800)
@@ -922,7 +890,6 @@ def main():
                                 total_skipped += 1
                                 continue
 
-                        # 2. 等待详情加载
                         publisher._sleep(2.0, minimum_seconds=1.0)
                         if not wait_for_detail_state(publisher, feed_id, timeout=10.0):
                             print("    -> [跳过] 详情加载超时。")
@@ -930,7 +897,6 @@ def main():
                             total_skipped += 1
                             continue
 
-                        # 3. 提取 DOM 评论
                         actual_comments = extract_comments_from_dom(publisher)
 
                         if len(actual_comments) < min_comment_count:
@@ -942,15 +908,13 @@ def main():
                             total_skipped += 1
                             continue
 
-                        # 取前 analyze_comment_count 条
                         comments_to_analyze = actual_comments[:analyze_comment_count]
                         print(
                             f"    -> 提取到 {len(actual_comments)} 条评论，"
                             f"取前 {len(comments_to_analyze)} 条送 LLM 分析..."
                         )
 
-                        # 4. LLM 分析
-                        llm_result = evaluate_comments_with_llm(comments_to_analyze)
+                        llm_result = evaluate_comments_with_llm(profile, comments_to_analyze)
 
                         if not llm_result:
                             print("    -> [跳过] LLM 分析失败。")
@@ -960,26 +924,23 @@ def main():
 
                         selected_idx = llm_result.get("selected_index", -1)
 
-                        # 无意向 → 跳过
                         if selected_idx == -1:
                             print(
-                                f"    -> [跳过] LLM 判定无相亲意向。"
+                                f"    -> [跳过] LLM 判定无业务意向。"
                                 f"原因: {llm_result.get('reason', '未提供')}"
                             )
-                            # 即使无意向也记入缓存，避免下次重复分析
                             cache[feed_id] = {
                                 "title": title,
                                 "status": "no_intent",
                                 "reason": llm_result.get("reason", ""),
                                 "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                             }
-                            save_cache(cache)
+                            save_cache(profile_name, cache)
                             close_detail_overlay(publisher)
                             total_skipped += 1
                             continue
 
-                        # 有意向 → 回复
-                        real_idx = selected_idx - 1  # LLM 返回 1-based
+                        real_idx = selected_idx - 1
                         if not (0 <= real_idx < len(comments_to_analyze)):
                             print(
                                 f"    -> [跳过] LLM 返回越界索引: {selected_idx}。"
@@ -1007,7 +968,6 @@ def main():
                         print(f"       原因: {llm_result.get('reason')}")
                         print(f"       回复: {reply_content}\n")
 
-                        # 5. 自动回复
                         print("    -> 正在发送回复...")
                         if not xsec_token:
                             print("    -> [提示] 当前笔记缺少 xsec_token，将在已打开详情页内直接回复。")
@@ -1023,7 +983,6 @@ def main():
                             reply_status = "success"
                             total_replies += 1
 
-                            # 5b. 给笔记点赞，方便后续在「我的赞」中找到已回复的笔记
                             try:
                                 publisher._like_note()
                             except Exception as like_err:
@@ -1033,8 +992,8 @@ def main():
                             print(f"    -> ❌ 回复发送失败: {e}")
                             reply_status = f"failed: {e}"
 
-                        # 保存结果
                         response_record = {
+                            "profile": profile_name,
                             "keyword": keyword,
                             "note_title": title,
                             "note_id": feed_id,
@@ -1048,7 +1007,6 @@ def main():
                         }
                         all_responses.append(response_record)
 
-                        # 写入缓存
                         cache[feed_id] = {
                             "title": title,
                             "target_user": user_name,
@@ -1056,9 +1014,8 @@ def main():
                             "status": reply_status,
                             "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                         }
-                        save_cache(cache)
+                        save_cache(profile_name, cache)
 
-                        # 6. 关闭浮层
                         print("    -> 关闭详情浮层，返回搜索结果...")
                         close_detail_overlay(publisher)
 
@@ -1069,22 +1026,18 @@ def main():
                         except Exception:
                             pass
 
-                    # 笔记间随机延迟
                     delay = random.uniform(post_delay_min, post_delay_max)
                     print(f"    -> 模拟浏览，等待 {delay:.1f}s...\n")
                     time.sleep(delay)
 
-                # 关键词间随机延迟
                 if kw_idx < len(keywords):
                     delay = random.uniform(keyword_delay_min, keyword_delay_max)
                     print(f"\n  ⏳ 切换关键词前等待 {delay:.1f}s...")
                     time.sleep(delay)
 
-            # --- 一轮结束，保存阶段性结果 ---
             if all_responses:
-                _save_results(all_responses, total_replies, total_skipped, round_number)
+                _save_results(profile_name, all_responses, total_replies, total_skipped, round_number)
 
-            # --- 轮次间长休息 ---
             delay = random.uniform(round_delay_min, round_delay_max)
             print(f"\n  🔁 第 {round_number} 轮结束 (回复 {total_replies} / 跳过 {total_skipped})")
             print(f"  ⏳ 休息 {delay:.0f}s 后开始第 {round_number + 1} 轮...")
@@ -1096,9 +1049,11 @@ def main():
         print(f"  ⛔ 用户中断（Ctrl+C），正在安全退出...")
         print(f"{'=' * 60}")
 
-    # --- 最终保存结果 ---
     if all_responses:
-        _save_results(all_responses, total_replies, total_skipped, round_number, is_final=True)
+        _save_results(
+            profile_name, all_responses, total_replies, total_skipped,
+            round_number, is_final=True,
+        )
     else:
         print("\n  没有回复记录需要保存。")
 

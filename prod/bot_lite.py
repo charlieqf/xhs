@@ -210,6 +210,35 @@ def evaluate_comments_with_llm(comments: list[dict]) -> dict | None:
 #  主逻辑
 # ============================================================
 
+def _check_rate_limit(page) -> bool:
+    """检测是否被限流，如果是则等待并恢复。返回 True 表示触发了限流。"""
+    url = page.url
+    if "error_code=300013" in url or "error_msg" in url:
+        wait_time = random.uniform(60, 120)
+        print(f"  ⚠️ [限流] 检测到访问频繁限制，等待 {wait_time:.0f} 秒后恢复...")
+        time.sleep(wait_time)
+        page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
+        time.sleep(random.uniform(5, 10))
+        return True
+    if "website-login/error" in url:
+        wait_time = random.uniform(90, 180)
+        print(f"  ⚠️ [风控] 被重定向到错误页，等待 {wait_time:.0f} 秒后恢复...")
+        time.sleep(wait_time)
+        page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
+        time.sleep(random.uniform(5, 10))
+        return True
+    return False
+
+def _human_delay(min_s: float = 2.0, max_s: float = 5.0):
+    """模拟人类操作间隔"""
+    time.sleep(random.uniform(min_s, max_s))
+
+def _random_scroll(page):
+    """随机滚动页面，模拟浏览行为"""
+    scroll_distance = random.randint(200, 600)
+    page.mouse.wheel(0, scroll_distance)
+    time.sleep(random.uniform(0.5, 1.5))
+
 def _save_results(all_responses: list[dict], total_replies: int, round_number: int):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     file_path = os.path.join(script_dir, f"bot_lite_responses_{timestamp}.json")
@@ -265,24 +294,29 @@ def main():
                 for kw_idx, keyword in enumerate(keywords, start=1):
                     print(f"\n{'─' * 50}\n[第{round_number}轮 {kw_idx}/{len(keywords)}] 🔍 搜索关键词: 「{keyword}」")
                     
+                    # 检测限流
+                    _check_rate_limit(page)
+                    
                     # 回到探索页，确保我们在一致的状态且不易被阻断
                     if "explore" not in page.url and "search" not in page.url:
                         page.goto("https://www.xiaohongshu.com/explore")
-                        time.sleep(2)
+                        _human_delay(3, 6)
                         
                     # 寻找搜索框并模拟输入
                     try:
                         search_input = page.locator("#search-input")
                         search_input.wait_for(state="visible", timeout=10000)
                         search_input.click()
+                        _human_delay(0.5, 1.5)
                         search_input.fill("") 
-                        # 模拟缓慢输入
-                        search_input.type(keyword, delay=100)
-                        time.sleep(0.5)
+                        # 模拟缓慢输入（更真实的逐字速度）
+                        search_input.type(keyword, delay=random.randint(80, 200))
+                        _human_delay(0.8, 2.0)
                         page.keyboard.press("Enter")
                     except PlaywrightTimeout:
                         print("  -> [跳过] 未能找到搜索框。重试刷新页面...")
                         page.goto("https://www.xiaohongshu.com/explore")
+                        _human_delay(3, 6)
                         continue
 
                     # 等待搜索结果出现
@@ -290,10 +324,13 @@ def main():
                         page.wait_for_selector("section.note-item, a.title", timeout=15000)
                     except PlaywrightTimeout:
                         print("  -> [跳过] 结果加载超时或没有结果。")
+                        if _check_rate_limit(page):
+                            continue
                         continue
 
-                    # 给点时间让瀑布流渲染完毕
-                    time.sleep(3)
+                    # 给点时间让瀑布流渲染完毕，模拟浏览
+                    _human_delay(3, 6)
+                    _random_scroll(page)
                     cards = page.locator("section.note-item").all()
                     top_feeds = cards[:post_per_keyword]
                     print(f"  -> 共渲染了 {len(cards)} 篇笔记，将查看前 {len(top_feeds)} 篇。")
@@ -319,21 +356,25 @@ def main():
                         print(f"  [{feed_idx}/{len(top_feeds)}] 📝 打开: {title}")
 
                         # 纯人工模拟：点击卡片进入详情浮层
+                        _human_delay(1.5, 3.5)  # 阅读标题后再点击
                         try:
                             card.click()
                             # 详情页出现
                             page.wait_for_selector(".comment-item, .note-container, .note-detail-mask", timeout=10000)
-                            time.sleep(2) # 等待评论区渲染
+                            _human_delay(2, 5)  # 模拟阅读笔记内容
+                            if _check_rate_limit(page):
+                                continue
                         except Exception as e:
                             print(f"    -> 点击卡片或等待详情页失败: {e}")
                             page.keyboard.press("Escape")
+                            _human_delay(1, 2)
                             continue
 
                         # 抓取评论
                         comment_elements = page.locator(".comment-item").all()
                         if len(comment_elements) < min_comment_count:
                             print(f"    -> [跳过] 评论数不足 ({len(comment_elements)} < {min_comment_count})。")
-                            page.go_back() # 或者按返回，关闭详情页
+                            page.keyboard.press("Escape")
                             time.sleep(1)
                             continue
 
@@ -351,14 +392,16 @@ def main():
                                 continue
 
                         if not comments_data:
-                            page.go_back()
+                            page.keyboard.press("Escape")
+                            time.sleep(1)
                             continue
 
                         # 让 LLM 分析
                         print(f"    -> 分析 {len(comments_data)} 条评论...")
                         llm_result = evaluate_comments_with_llm(comments_data)
                         if not llm_result:
-                            page.go_back()
+                            page.keyboard.press("Escape")
+                            time.sleep(1)
                             continue
 
                         selected_idx = llm_result.get("selected_index", -1) - 1
@@ -367,7 +410,8 @@ def main():
                         if selected_idx < 0 or selected_idx >= len(comments_data):
                             print(f"    -> [跳过] 无意向客户。({reason})")
                             cache[cache_key] = {"status": "no_intent"}
-                            page.go_back()
+                            page.keyboard.press("Escape")
+                            time.sleep(1)
                             continue
 
                         # 发现了意向客户，开始回复
@@ -420,16 +464,16 @@ def main():
                             print(f"    -> ❌ 模拟回复失败: {e}")
 
                         # 退出浮层
-                        page.go_back()
-                        time.sleep(random.uniform(2, 4))
+                        page.keyboard.press("Escape")
+                        time.sleep(random.uniform(5, 12))
                         save_cache(cache)
 
                     print(f"  ⏳ 切换关键词暂歇...")
-                    time.sleep(random.uniform(5, 10))
+                    time.sleep(random.uniform(15, 30))
 
                 _save_results(all_responses, total_replies, round_number)
                 print(f"  🔁 轮次结束休息...")
-                time.sleep(random.uniform(15, 30))
+                time.sleep(random.uniform(60, 120))
 
         except KeyboardInterrupt:
             print("\n⛔ 任务被手动停止。")
