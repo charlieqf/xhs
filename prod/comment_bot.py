@@ -22,6 +22,7 @@ import random
 script_dir = os.path.dirname(os.path.abspath(__file__))
 base_dir = os.path.dirname(script_dir)
 sys.path.insert(0, os.path.join(base_dir, "scripts"))
+COMMENT_RESPONSES_DIR = os.path.join(script_dir, "comment_responses")
 
 # 解析 .env 文件
 env_path = os.path.join(base_dir, ".env")
@@ -753,7 +754,11 @@ def parse_comment_count(count_str: str) -> int:
 def _save_results(all_responses: list[dict], total_replies: int, total_skipped: int, round_number: int, is_final: bool = False):
     """保存当前累计的回复结果到 JSON 文件。"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    result_file = os.path.join(script_dir, f"comment_responses_{timestamp}.json")
+    os.makedirs(COMMENT_RESPONSES_DIR, exist_ok=True)
+    result_file = os.path.join(
+        COMMENT_RESPONSES_DIR,
+        f"comment_responses_{timestamp}.json",
+    )
 
     label = "最终" if is_final else f"第{round_number}轮"
     print(f"\n{'=' * 60}")

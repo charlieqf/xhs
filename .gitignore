@@ -54,7 +54,9 @@ images/publish_temp/*
 Thumbs.db
 *.zip
 prod/bot_lite_responses_*.json
-prod/comment_responses_*.json
+prod/comment_responses/*.json
+prod/comment_responses/*.html
+!prod/comment_responses/.gitkeep
 prod/processed_cache_*.json
 prod/processed_cache_lite.json
 prod/profiles/* copy.json

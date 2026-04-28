@@ -128,7 +128,8 @@ python prod/general_comment_bot.py medical_beauty
 
 ### 输出文件
 
-- `prod/comment_responses.json`：回复记录
+- `prod/comment_responses/comment_responses*.json`：回复记录
+- `prod/comment_responses/comment_report_*.html`：`python prod/comment_count.py` 生成的统计报告
 - `prod/processed_cache.json`：已处理缓存（避免重复）
 
 ## 常用命令

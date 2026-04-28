@@ -9,30 +9,57 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 import json
 import glob
 import os
+import argparse
 from collections import Counter, defaultdict
 from datetime import datetime
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+COMMENT_RESPONSES_DIR = os.path.join(SCRIPT_DIR, "comment_responses")
+
 
 def load_all_responses(directory: str) -> list[dict]:
-    """加载目录下所有 comment_response*.json 文件。"""
+    """加载目录下所有 comment_responses*.json 文件。"""
     records = []
+    seen_records = set()
     patterns = [
-        os.path.join(directory, "comment_response*.json"),
+        os.path.join(directory, "comment_responses*.json"),
     ]
     seen_files = set()
     for pattern in patterns:
-        for path in glob.glob(pattern):
+        for path in sorted(glob.glob(pattern)):
             # 跳过子目录中的文件
             if os.path.dirname(os.path.abspath(path)) != os.path.abspath(directory):
                 continue
             if path in seen_files:
                 continue
             seen_files.add(path)
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    records.extend(data)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for rec in data:
+                            if not isinstance(rec, dict):
+                                continue
+                            key = get_record_key(rec)
+                            if key in seen_records:
+                                continue
+                            seen_records.add(key)
+                            records.append(rec)
+            except (json.JSONDecodeError, OSError) as exc:
+                print(f"跳过无法读取的结果文件：{path} ({exc})")
     return records
+
+
+def get_record_key(record: dict) -> tuple:
+    """生成回复记录去重键，避免累计快照文件重复计数。"""
+    return (
+        record.get("profile", ""),
+        record.get("note_id", ""),
+        record.get("target_comment_id", ""),
+        record.get("timestamp", ""),
+        record.get("generated_reply", ""),
+        record.get("send_status", ""),
+    )
 
 
 def parse_date(timestamp: str) -> str:
@@ -543,7 +570,7 @@ def generate_html_report(daily: dict, output_path: str):
   </div>
 
   <div class="footer">
-    生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 数据来源：comment_response*.json
+    生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 数据来源：comment_responses/comment_responses*.json
   </div>
 
 </div>
@@ -888,8 +915,20 @@ def print_report(daily: dict):
 
 
 def main():
-    directory = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser(
+        description="统计 prod/comment_responses 下的评论回复结果",
+    )
+    parser.add_argument(
+        "--directory",
+        default=COMMENT_RESPONSES_DIR,
+        help="结果 JSON 所在目录，默认 prod/comment_responses",
+    )
+    args = parser.parse_args()
+
+    directory = os.path.abspath(args.directory)
+    os.makedirs(directory, exist_ok=True)
     records = load_all_responses(directory)
+    print(f"统计目录: {directory}")
     print(f"加载 {len(records)} 条记录")
 
     daily = compute_daily_stats(records)

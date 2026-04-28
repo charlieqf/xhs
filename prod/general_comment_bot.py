@@ -50,6 +50,7 @@ OPENROUTER_API_KEY = (
 )
 
 PROFILES_DIR = os.path.join(script_dir, "profiles")
+COMMENT_RESPONSES_DIR = os.path.join(script_dir, "comment_responses")
 
 # ============================================================
 #  Profile 加载
@@ -692,8 +693,10 @@ def _save_results(
 ):
     """保存当前累计的回复结果到 JSON 文件。"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    os.makedirs(COMMENT_RESPONSES_DIR, exist_ok=True)
     result_file = os.path.join(
-        script_dir, f"comment_responses_{profile_name}_{timestamp}.json"
+        COMMENT_RESPONSES_DIR,
+        f"comment_responses_{profile_name}_{timestamp}.json",
     )
 
     label = "最终" if is_final else f"第{round_number}轮"

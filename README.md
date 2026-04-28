@@ -399,7 +399,8 @@ python prod/general_comment_bot.py medical_beauty
 旧版配置仍是：`prod/config.json`（关键词数量、评论门槛、延迟等）+ `prod/keywords.json`（关键词模板与城市/平台/运动列表），运行 `python prod/comment_bot.py`。
 
 输出：
-- `prod/comment_responses.json`：回复记录
+- `prod/comment_responses/comment_responses*.json`：回复记录
+- `prod/comment_responses/comment_report_*.html`：`python prod/comment_count.py` 生成的统计报告
 - `prod/processed_cache.json`：已处理缓存
 
 ## RoadMap
