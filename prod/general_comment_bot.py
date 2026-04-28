@@ -426,6 +426,15 @@ def _card_rect_js(feed_id: str) -> str:
     return f"""
         (() => {{
             const feedId = "{feed_id}";
+            const noteIdFromHref = (href) => {{
+                try {{
+                    const url = new URL(href, window.location.origin);
+                    const match = url.pathname.match(/^\\/explore\\/([^/?#]+)/);
+                    return match ? match[1] : "";
+                }} catch (_) {{
+                    return "";
+                }}
+            }};
             const visibleRect = (el) => {{
                 if (!(el instanceof HTMLElement)) return null;
                 const rect = el.getBoundingClientRect();
@@ -435,37 +444,21 @@ def _card_rect_js(feed_id: str) -> str:
                 return rect;
             }};
 
-            const cardSelector = [
-                "section.note-item",
-                "div.note-item",
-                "[class*='note-item']",
-                "[class*='feed']",
-                "[class*='card']",
-                "article",
-                "li"
-            ].join(",");
+            for (const card of document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")) {{
+                const links = Array.from(card.querySelectorAll('a[href^="/explore/"], a[href*="/explore/"]'));
+                if (!links.some((link) => noteIdFromHref(link.getAttribute("href") || link.href) === feedId)) {{
+                    continue;
+                }}
 
-            const candidates = [];
-            for (const link of document.querySelectorAll('a[href*="' + feedId + '"]')) {{
-                candidates.push(link);
-                const card = link.closest(cardSelector);
-                if (card) candidates.push(card);
-            }}
-            for (const el of document.querySelectorAll(
-                '[data-note-id="' + feedId + '"], ' +
-                '[data-feed-id="' + feedId + '"], ' +
-                '[note-id="' + feedId + '"], ' +
-                '[feed-id="' + feedId + '"]'
-            )) {{
-                candidates.push(el);
-                const card = el.closest(cardSelector);
-                if (card) candidates.push(card);
-            }}
-
-            for (const el of candidates) {{
-                const rect = visibleRect(el);
-                if (!rect) continue;
-                return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                const cover = links.find((link) => {{
+                    if (!(link instanceof HTMLElement)) return false;
+                    if (!link.classList.contains("cover")) return false;
+                    return noteIdFromHref(link.getAttribute("href") || link.href) === feedId;
+                }});
+                const rect = visibleRect(cover) || visibleRect(card);
+                if (rect) {{
+                    return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+                }}
             }}
             return null;
         }})()
@@ -478,30 +471,32 @@ def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
 
 
 def _center_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
-    """把目标卡片滚到视口中间，兼容自定义滚动容器。"""
+    """把目标笔记卡片滚到视口中间。"""
     return bool(publisher._evaluate(f"""
         (() => {{
             const feedId = "{feed_id}";
-            const cardSelector = [
-                "section.note-item",
-                "div.note-item",
-                "[class*='note-item']",
-                "[class*='feed']",
-                "[class*='card']",
-                "article",
-                "li"
-            ].join(",");
-            const selectors = [
-                'a[href*="' + feedId + '"]',
-                '[data-note-id="' + feedId + '"]',
-                '[data-feed-id="' + feedId + '"]',
-                '[note-id="' + feedId + '"]',
-                '[feed-id="' + feedId + '"]'
-            ];
-            for (const selector of selectors) {{
-                for (const node of document.querySelectorAll(selector)) {{
-                    if (!(node instanceof HTMLElement)) continue;
-                    const target = node.closest(cardSelector) || node;
+            const noteIdFromHref = (href) => {{
+                try {{
+                    const url = new URL(href, window.location.origin);
+                    const match = url.pathname.match(/^\\/explore\\/([^/?#]+)/);
+                    return match ? match[1] : "";
+                }} catch (_) {{
+                    return "";
+                }}
+            }};
+            for (const card of document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")) {{
+                const links = Array.from(card.querySelectorAll('a[href^="/explore/"], a[href*="/explore/"]'));
+                if (!links.some((link) => noteIdFromHref(link.getAttribute("href") || link.href) === feedId)) {{
+                    continue;
+                }}
+
+                const cover = links.find((link) => (
+                    link instanceof HTMLElement &&
+                    link.classList.contains("cover") &&
+                    noteIdFromHref(link.getAttribute("href") || link.href) === feedId
+                ));
+                const target = cover || card;
+                if (target instanceof HTMLElement) {{
                     target.scrollIntoView({{ behavior: "instant", block: "center", inline: "center" }});
                     return true;
                 }}
@@ -552,19 +547,31 @@ def _seek_card_by_scrolling(
             return True
         _scroll_search_page(publisher, pixels=420 + (step % 3) * 120)
     visible_ids = publisher._evaluate("""
-        (() => Array.from(document.querySelectorAll("a[href*='/explore/']"))
-            .map((link) => {
+        (() => {
+            const noteIdFromHref = (href) => {
                 try {
-                    const url = new URL(link.href, window.location.origin);
-                    const match = url.pathname.match(/\\/explore\\/([^/?#]+)/);
+                    const url = new URL(href, window.location.origin);
+                    const match = url.pathname.match(/^\\/explore\\/([^/?#]+)/);
                     return match ? match[1] : "";
                 } catch (_) {
                     return "";
                 }
-            })
-            .filter(Boolean)
-            .slice(0, 12)
-        )()
+            };
+            const ids = [];
+            const seen = new Set();
+            for (const card of document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")) {
+                const rect = card.getBoundingClientRect();
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+                const link = Array.from(card.querySelectorAll('a[href^="/explore/"], a[href*="/explore/"]'))
+                    .find((node) => noteIdFromHref(node.getAttribute("href") || node.href));
+                const id = link ? noteIdFromHref(link.getAttribute("href") || link.href) : "";
+                if (!id || seen.has(id)) continue;
+                seen.add(id);
+                ids.push(id);
+                if (ids.length >= 12) break;
+            }
+            return ids;
+        })()
     """)
     print(f"    -> [调试] 未定位到目标卡片，可见笔记ID: {visible_ids}")
     return False
