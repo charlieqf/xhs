@@ -1,0 +1,1 @@
+python prod/general_comment_bot.py medical_beauty

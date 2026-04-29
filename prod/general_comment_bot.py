@@ -100,6 +100,40 @@ def get_prompt(profile: dict, name: str) -> str:
     raise ValueError(f"profile 缺少 llm_prompts.{name} 配置")
 
 
+def get_target_provinces(profile: dict) -> list[str]:
+    """读取并标准化 profile 中限制处理的目标省份。"""
+    raw = profile.get("target_provinces", [])
+    if isinstance(raw, str):
+        raw = [item.strip() for item in re.split(r"[,，、\s]+", raw)]
+    if not isinstance(raw, list):
+        return []
+
+    provinces: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        province = str(item).strip()
+        if province and province not in seen:
+            provinces.append(province)
+            seen.add(province)
+    return provinces
+
+
+def filter_comments_by_target_provinces(
+    comments: list[dict],
+    target_provinces: list[str],
+) -> list[dict]:
+    """有 target_provinces 配置时，只保留对应省份的评论。"""
+    if not target_provinces:
+        return comments
+
+    allowed = set(target_provinces)
+    return [
+        comment
+        for comment in comments
+        if str(comment.get("province", "")).strip() in allowed
+    ]
+
+
 # ============================================================
 #  关键词生成
 # ============================================================
@@ -312,8 +346,11 @@ def evaluate_comments_with_llm(
     comments_text = ""
     for i, c in enumerate(comments):
         user = c.get("userInfo", {}).get("nickname", "Unknown")
+        province = c.get("province") or "未知"
         content = c.get("content", "").replace("\n", " ")
-        comments_text += f"[{i + 1}] 用户: {user}, 评论: {content}\n"
+        comments_text += (
+            f"[{i + 1}] 用户: {user}, 省份: {province}, 评论: {content}\n"
+        )
 
     prompt = render_prompt(
         get_prompt(profile, "comment_user"),
@@ -421,6 +458,275 @@ def _scroll_search_page(publisher: XiaohongshuPublisher, pixels: int = 600):
     publisher._sleep(1.2, minimum_seconds=0.8)
 
 
+def _scroll_feeds_container_area(
+    publisher: XiaohongshuPublisher,
+    pixels: int,
+) -> bool:
+    """小幅滚动承载 feeds-container 的搜索结果区域。"""
+    result = publisher._evaluate(f"""
+        (() => {{
+            const delta = {pixels};
+            const feeds = document.querySelector(
+                ".feeds-container, [class*='feeds-container'], #exploreFeeds"
+            );
+            if (!(feeds instanceof HTMLElement)) {{
+                return {{ ok: false, reason: "feeds_not_found" }};
+            }}
+
+            const isScrollable = (el) => {{
+                if (!el) return false;
+                return el.scrollHeight > el.clientHeight + 40;
+            }};
+
+            const candidates = [];
+            let node = feeds;
+            while (node && node instanceof HTMLElement) {{
+                candidates.push(node);
+                node = node.parentElement;
+            }}
+            candidates.push(
+                document.scrollingElement,
+                document.documentElement,
+                document.body
+            );
+
+            const target = candidates.find(isScrollable);
+            const beforeWindow = window.scrollY || window.pageYOffset || 0;
+            if (target && typeof target.scrollBy === "function") {{
+                const before = target.scrollTop || 0;
+                target.scrollBy({{ top: delta, behavior: "instant" }});
+                target.dispatchEvent(new WheelEvent("wheel", {{
+                    deltaY: delta,
+                    bubbles: true,
+                    cancelable: true,
+                }}));
+                const after = target.scrollTop || 0;
+                const afterWindow = window.scrollY || window.pageYOffset || 0;
+                return {{
+                    ok: after !== before || afterWindow !== beforeWindow,
+                    reason: "element_scroll",
+                    before,
+                    after,
+                    beforeWindow,
+                    afterWindow,
+                }};
+            }}
+
+            window.scrollBy({{ top: delta, behavior: "instant" }});
+            window.dispatchEvent(new WheelEvent("wheel", {{
+                deltaY: delta,
+                bubbles: true,
+                cancelable: true,
+            }}));
+            const afterWindow = window.scrollY || window.pageYOffset || 0;
+            return {{
+                ok: afterWindow !== beforeWindow,
+                reason: "window_scroll",
+                beforeWindow,
+                afterWindow,
+            }};
+        }})()
+    """)
+    publisher._sleep(0.8, minimum_seconds=0.35)
+    return bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+
+
+def _extract_search_feeds_from_dom(publisher: XiaohongshuPublisher) -> list[dict]:
+    """从当前搜索结果 DOM 中提取已渲染的笔记卡片。"""
+    raw = publisher._evaluate("""
+        (() => {
+            const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+            const noteIdFromHref = (href) => {
+                try {
+                    const url = new URL(href, window.location.origin);
+                    const match = url.pathname.match(/^\\/explore\\/([^/?#]+)/);
+                    return match ? {
+                        id: match[1],
+                        xsecToken: url.searchParams.get("xsec_token") || "",
+                    } : null;
+                } catch (_) {
+                    return null;
+                }
+            };
+            const output = [];
+            const seen = new Set();
+            const cards = Array.from(
+                document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")
+            );
+
+            for (const card of cards) {
+                if (!(card instanceof HTMLElement)) continue;
+                const rawIndex = card.getAttribute("data-index");
+                const domIndex = rawIndex && /^\\d+$/.test(rawIndex)
+                    ? Number(rawIndex)
+                    : null;
+                const links = Array.from(card.querySelectorAll(
+                    'a[href^="/explore/"], a[href*="/explore/"]'
+                ));
+                const parsed = links
+                    .map((link) => noteIdFromHref(link.getAttribute("href") || link.href))
+                    .find(Boolean);
+                if (!parsed || !parsed.id || seen.has(parsed.id)) continue;
+                seen.add(parsed.id);
+
+                const titleEl = card.querySelector(
+                    ".title, [class*='title'], [class*='desc'], [class*='footer']"
+                );
+                const title = normalize(
+                    titleEl ? titleEl.textContent : card.textContent
+                ) || "未命名笔记";
+                const commentEl = card.querySelector(
+                    "[class*='comment'] .count, [class*='chat'] .count, [class*='comment']"
+                );
+                const commentCount = normalize(commentEl ? commentEl.textContent : "");
+
+                output.push({
+                    id: parsed.id,
+                    xsecToken: parsed.xsecToken,
+                    _domIndex: domIndex,
+                    _commentCountUnknown: !commentCount,
+                    noteCard: {
+                        displayTitle: title,
+                        interactInfo: { commentCount: commentCount || "0" },
+                        user: { xsecToken: parsed.xsecToken },
+                    },
+                });
+            }
+            return JSON.stringify(output);
+        })()
+    """)
+    if raw and isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
+def _merge_feeds(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    """按 ID 合并笔记列表，并补齐 DOM 定位信息。"""
+    merged: list[dict] = []
+    by_id: dict[str, dict] = {}
+    for feed in existing + incoming:
+        feed_id = str(feed.get("id", "")).strip()
+        if not feed_id:
+            continue
+
+        if feed_id not in by_id:
+            copied = dict(feed)
+            by_id[feed_id] = copied
+            merged.append(copied)
+            continue
+
+        target = by_id[feed_id]
+        if target.get("_domIndex") is None and feed.get("_domIndex") is not None:
+            target["_domIndex"] = feed.get("_domIndex")
+        if not target.get("xsecToken") and feed.get("xsecToken"):
+            target["xsecToken"] = feed.get("xsecToken")
+
+        target_card = target.get("noteCard", {})
+        incoming_card = feed.get("noteCard", {})
+        if isinstance(target_card, dict) and isinstance(incoming_card, dict):
+            if not target_card.get("displayTitle") and incoming_card.get("displayTitle"):
+                target_card["displayTitle"] = incoming_card.get("displayTitle")
+            target_info = target_card.get("interactInfo", {})
+            incoming_info = incoming_card.get("interactInfo", {})
+            if isinstance(target_info, dict) and isinstance(incoming_info, dict):
+                current_count = str(target_info.get("commentCount", "")).strip()
+                incoming_count = str(incoming_info.get("commentCount", "")).strip()
+                if current_count in ("", "0") and incoming_count not in ("", "0"):
+                    target_info["commentCount"] = incoming_count
+                    target["_commentCountUnknown"] = False
+    return merged
+
+
+def _sort_feeds_by_dom_index(feeds: list[dict]) -> list[dict]:
+    """按真实 data-index 排序；没有 data-index 的记录保持在后面。"""
+    indexed = list(enumerate(feeds))
+
+    def sort_key(item: tuple[int, dict]) -> tuple[int, int]:
+        original_index, feed = item
+        dom_index = feed.get("_domIndex")
+        if isinstance(dom_index, int):
+            return (0, dom_index)
+        return (1, original_index)
+
+    return [feed for _, feed in sorted(indexed, key=sort_key)]
+
+
+def _reset_search_results_scroll(publisher: XiaohongshuPublisher):
+    """回到搜索结果页顶部，方便从第一篇开始逐条处理。"""
+    publisher._evaluate("""
+        (() => {
+            const roots = [
+                document.scrollingElement,
+                document.documentElement,
+                document.body,
+                ...document.querySelectorAll(
+                    "main, [class*='search'], [class*='feeds'], [class*='waterfall'], [class*='container']"
+                )
+            ].filter(Boolean);
+            for (const root of roots) {
+                if (root.scrollHeight > root.clientHeight + 40) {
+                    root.scrollTo({ top: 0, behavior: "instant" });
+                }
+            }
+            return true;
+        })()
+    """)
+    publisher._sleep(1.0, minimum_seconds=0.5)
+
+
+def load_more_search_feeds(
+    publisher: XiaohongshuPublisher,
+    feeds: list[dict],
+    target_count: int,
+    max_scrolls: int = 12,
+) -> tuple[list[dict], int]:
+    """滚动搜索结果页，尽量加载到 target_count 篇笔记后回到顶部。"""
+    if target_count <= len(feeds):
+        feeds = _sort_feeds_by_dom_index(
+            _merge_feeds(feeds, _extract_search_feeds_from_dom(publisher))
+        )
+        return feeds, 0
+
+    merged = _merge_feeds(feeds, _extract_search_feeds_from_dom(publisher))
+    if len(merged) >= target_count:
+        _reset_search_results_scroll(publisher)
+        return _sort_feeds_by_dom_index(merged), 0
+
+    print(
+        f"  -> 当前仅 {len(merged)} 篇，目标 {target_count} 篇，"
+        f"开始滚动加载更多搜索结果..."
+    )
+    stagnant_rounds = 0
+    scroll_count = 0
+    for _ in range(max_scrolls):
+        before = len(merged)
+        _scroll_search_page(publisher, pixels=random.randint(900, 1300))
+        scroll_count += 1
+        dom_feeds = _extract_search_feeds_from_dom(publisher)
+        merged = _merge_feeds(merged, dom_feeds)
+
+        if len(merged) >= target_count:
+            break
+        if len(merged) == before:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+        if stagnant_rounds >= 3:
+            break
+
+    if len(merged) > len(feeds):
+        print(f"  -> 加载后可处理笔记增至 {len(merged)} 篇。")
+    else:
+        print("  -> 滚动后没有加载到更多笔记。")
+    print(f"  -> 搜索结果补加载滚动 {scroll_count} 次，回到页首后开始处理。")
+    _reset_search_results_scroll(publisher)
+    return _sort_feeds_by_dom_index(merged), scroll_count
+
+
 def _card_rect_js(feed_id: str) -> str:
     """返回定位指定笔记卡片点击区域的 JS 片段。"""
     return f"""
@@ -463,6 +769,268 @@ def _card_rect_js(feed_id: str) -> str:
             return null;
         }})()
     """
+
+
+def _card_rect_by_index_js(feed_index: int) -> str:
+    """返回当前搜索结果 DOM 中指定序号卡片的点击区域。"""
+    return f"""
+        (() => {{
+            const targetIndex = {feed_index};
+            const visibleRect = (el) => {{
+                if (!(el instanceof HTMLElement)) return null;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 20 || rect.height < 20) return null;
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) return null;
+                if (rect.right <= 0 || rect.left >= window.innerWidth) return null;
+                return rect;
+            }};
+            const cards = Array.from(
+                document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")
+            );
+            const card = cards.find((node) => (
+                node instanceof HTMLElement &&
+                node.getAttribute("data-index") === String(targetIndex)
+            )) || cards[targetIndex];
+            if (!(card instanceof HTMLElement)) return null;
+
+            const cover = Array.from(card.querySelectorAll("a.cover, a[href*='/explore/']"))
+                .find((node) => visibleRect(node));
+            const rect = visibleRect(cover) || visibleRect(card);
+            if (rect) {{
+                return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+            }}
+            return null;
+        }})()
+    """
+
+
+def _card_visibility_by_index(
+    publisher: XiaohongshuPublisher,
+    feed_index: int,
+) -> dict:
+    """检查目标 data-index 是否已渲染，以及是否在当前视口可点击。"""
+    result = publisher._evaluate(f"""
+        (() => {{
+            const targetIndex = {feed_index};
+            const visibleRect = (el) => {{
+                if (!(el instanceof HTMLElement)) return null;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 20 || rect.height < 20) return null;
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) return null;
+                if (rect.right <= 0 || rect.left >= window.innerWidth) return null;
+                const clickX = rect.x + rect.width / 2;
+                const clickY = rect.y + rect.height / 2;
+                return {{
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                    clickX,
+                    clickY,
+                    centerInViewport: (
+                        clickX >= 0 &&
+                        clickX <= window.innerWidth &&
+                        clickY >= 0 &&
+                        clickY <= window.innerHeight
+                    ),
+                }};
+            }};
+            const cards = Array.from(
+                document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")
+            );
+            const card = cards.find((node) => (
+                node instanceof HTMLElement &&
+                node.getAttribute("data-index") === String(targetIndex)
+            ));
+            if (!(card instanceof HTMLElement)) {{
+                return {{
+                    exists: false,
+                    clickable: false,
+                    rect: null,
+                    viewport: {{
+                        width: window.innerWidth,
+                        height: window.innerHeight,
+                    }},
+                }};
+            }}
+
+            const cover = Array.from(card.querySelectorAll("a.cover, a[href*='/explore/']"))
+                .find((node) => visibleRect(node));
+            const rect = visibleRect(cover) || visibleRect(card);
+            return {{
+                exists: true,
+                clickable: !!(rect && rect.centerInViewport),
+                rect,
+                viewport: {{
+                    width: window.innerWidth,
+                    height: window.innerHeight,
+                }},
+            }};
+        }})()
+    """)
+    return result if isinstance(result, dict) else {
+        "exists": False,
+        "clickable": False,
+        "rect": None,
+        "viewport": None,
+    }
+
+
+def _format_card_visibility(state: dict) -> str:
+    """格式化卡片定位状态，便于日志排查坐标问题。"""
+    rect = state.get("rect")
+    viewport = state.get("viewport")
+    rect_text = "None"
+    viewport_text = "None"
+    if isinstance(rect, dict):
+        rect_text = (
+            f"x={rect.get('x')}, y={rect.get('y')}, "
+            f"w={rect.get('width')}, h={rect.get('height')}, "
+            f"clickX={rect.get('clickX')}, clickY={rect.get('clickY')}, "
+            f"centerInViewport={rect.get('centerInViewport')}"
+        )
+    if isinstance(viewport, dict):
+        viewport_text = (
+            f"w={viewport.get('width')}, h={viewport.get('height')}"
+        )
+    return (
+        f"exists={bool(state.get('exists'))}, "
+        f"clickable={bool(state.get('clickable'))}, "
+        f"rect=({rect_text}), viewport=({viewport_text})"
+    )
+
+
+def _center_card_by_index_in_dom(
+    publisher: XiaohongshuPublisher,
+    feed_index: int,
+) -> bool:
+    """把当前搜索结果 DOM 中指定序号卡片滚到视口中间。"""
+    return bool(publisher._evaluate(f"""
+        (() => {{
+            const cards = Array.from(
+                document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")
+            );
+            const targetIndex = {feed_index};
+            const card = cards.find((node) => (
+                node instanceof HTMLElement &&
+                node.getAttribute("data-index") === String(targetIndex)
+            )) || cards[targetIndex];
+            if (!(card instanceof HTMLElement)) return false;
+            const cover = card.querySelector("a.cover, a[href*='/explore/']");
+            const target = cover instanceof HTMLElement ? cover : card;
+            target.scrollIntoView({{
+                behavior: "instant",
+                block: "center",
+                inline: "center"
+            }});
+            return true;
+        }})()
+    """))
+
+
+def _visible_search_data_index_range(
+    publisher: XiaohongshuPublisher,
+) -> tuple[int | None, int | None]:
+    """返回当前搜索结果 DOM 中 note-item 的 data-index 范围。"""
+    result = publisher._evaluate("""
+        (() => {
+            const indexes = Array.from(
+                document.querySelectorAll("#exploreFeeds section.note-item, section.note-item")
+            )
+                .map((node) => node instanceof HTMLElement ? node.getAttribute("data-index") : "")
+                .filter((value) => value && /^\\d+$/.test(value))
+                .map((value) => Number(value));
+            if (!indexes.length) return null;
+            return { min: Math.min(...indexes), max: Math.max(...indexes) };
+        })()
+    """)
+    if not isinstance(result, dict):
+        return None, None
+    min_index = result.get("min")
+    max_index = result.get("max")
+    if not isinstance(min_index, int) or not isinstance(max_index, int):
+        return None, None
+    return min_index, max_index
+
+
+def _bring_search_card_index_into_dom(
+    publisher: XiaohongshuPublisher,
+    feed_index: int,
+    replay_scrolls: int = 0,
+) -> bool:
+    """从页首重放补加载滚动次数，直到目标 data-index 出现在 DOM 中。"""
+    def centered_and_clickable() -> bool:
+        before = _card_visibility_by_index(publisher, feed_index)
+        if before.get("clickable"):
+            return True
+        if not _center_card_by_index_in_dom(publisher, feed_index):
+            return False
+        publisher._sleep(0.8, minimum_seconds=0.4)
+        after = _card_visibility_by_index(publisher, feed_index)
+        return bool(after.get("clickable"))
+
+    def nudge_until_clickable(max_nudges: int = 3) -> bool:
+        for _ in range(max_nudges):
+            state = _card_visibility_by_index(publisher, feed_index)
+            if state.get("clickable"):
+                return True
+            rect = state.get("rect")
+            viewport = state.get("viewport")
+            if not isinstance(rect, dict) or not isinstance(viewport, dict):
+                return False
+
+            click_y = float(rect.get("clickY") or 0)
+            viewport_h = float(viewport.get("height") or 0)
+            if viewport_h <= 0:
+                return False
+
+            if click_y > viewport_h:
+                delta = min(max(click_y - viewport_h + 80, 160), 420)
+                print(
+                    f"    -> [调试] 卡片中心 y={click_y:.1f} 超出视口 "
+                    f"h={viewport_h:.1f}，下滚 {delta:.0f}px 后再点击。"
+                )
+                if not _scroll_feeds_container_area(publisher, pixels=int(delta)):
+                    return False
+            elif click_y < 0:
+                delta = min(max(abs(click_y) + 80, 160), 420)
+                print(
+                    f"    -> [调试] 卡片中心 y={click_y:.1f} 在视口上方，"
+                    f"上滚 {delta:.0f}px 后再点击。"
+                )
+                if not _scroll_feeds_container_area(publisher, pixels=-int(delta)):
+                    return False
+            else:
+                return False
+        return bool(_card_visibility_by_index(publisher, feed_index).get("clickable"))
+
+    if replay_scrolls <= 0:
+        return False
+
+    print(
+        f"    -> [调试] 从页首重放 {replay_scrolls} 次补加载滚动，"
+        f"定位 data-index={feed_index}。"
+    )
+    _reset_search_results_scroll(publisher)
+    if centered_and_clickable() or nudge_until_clickable():
+        return True
+
+    for step in range(replay_scrolls):
+        did_scroll = _scroll_feeds_container_area(publisher, pixels=950)
+        visible_state = _card_visibility_by_index(publisher, feed_index)
+        if centered_and_clickable() or nudge_until_clickable():
+            return True
+        min_index, max_index = _visible_search_data_index_range(publisher)
+        print(
+            f"    -> [调试] 重放滚动 {step + 1}/{replay_scrolls} 后，"
+            f"当前窗口 data-index={min_index}-{max_index}，"
+            f"目标状态: {_format_card_visibility(visible_state)}，"
+            f"滚动{'成功' if did_scroll else '未生效'}。"
+        )
+        if not did_scroll and min_index is None and max_index is None:
+            return False
+
+    return False
 
 
 def _find_card_in_dom(publisher: XiaohongshuPublisher, feed_id: str) -> bool:
@@ -581,9 +1149,93 @@ def click_note_card(
     publisher: XiaohongshuPublisher,
     feed_id: str,
     feed_index: int = 0,
+    replay_scrolls: int = 0,
+    force_replay: bool = False,
 ) -> bool:
-    """通过 CDP 鼠标点击指定 feed_id 的笔记卡片封面。"""
-    _ = feed_index  # 保留参数，调用方日志仍按搜索结果顺序展示。
+    """通过 CDP 鼠标点击已加载搜索结果中的笔记卡片封面。"""
+    def nudge_index_click_center_into_view(max_nudges: int = 3) -> bool:
+        for _ in range(max_nudges):
+            state = _card_visibility_by_index(publisher, feed_index)
+            if state.get("clickable"):
+                return True
+            rect = state.get("rect")
+            viewport = state.get("viewport")
+            if not isinstance(rect, dict) or not isinstance(viewport, dict):
+                return False
+
+            click_y = float(rect.get("clickY") or 0)
+            viewport_h = float(viewport.get("height") or 0)
+            if viewport_h <= 0:
+                return False
+
+            if click_y > viewport_h:
+                delta = min(max(click_y - viewport_h + 80, 160), 420)
+                print(
+                    f"    -> [调试] 点击中心 y={click_y:.1f} 超出视口 "
+                    f"h={viewport_h:.1f}，下滚 {delta:.0f}px 后再点击。"
+                )
+                if not _scroll_feeds_container_area(publisher, pixels=int(delta)):
+                    return False
+            elif click_y < 0:
+                delta = min(max(abs(click_y) + 80, 160), 420)
+                print(
+                    f"    -> [调试] 点击中心 y={click_y:.1f} 在视口上方，"
+                    f"上滚 {delta:.0f}px 后再点击。"
+                )
+                if not _scroll_feeds_container_area(publisher, pixels=-int(delta)):
+                    return False
+            else:
+                return False
+        return bool(_card_visibility_by_index(publisher, feed_index).get("clickable"))
+
+    if feed_index >= 0:
+        initial_visibility = _card_visibility_by_index(publisher, feed_index)
+        print(
+            f"    -> [调试] 点击前 data-index={feed_index} "
+            f"卡片状态: {_format_card_visibility(initial_visibility)}"
+        )
+        if not initial_visibility.get("clickable") and initial_visibility.get("exists"):
+            nudge_index_click_center_into_view()
+        if (
+            not force_replay
+            and _card_visibility_by_index(publisher, feed_index).get("clickable")
+        ):
+            for retry in range(3):
+                try:
+                    publisher._click_element_by_cdp(
+                        "note card cover by index",
+                        _card_rect_by_index_js(feed_index),
+                    )
+                    return True
+                except Exception as e:
+                    if retry < 2:
+                        print(
+                            f"    -> [调试] 按序号点击卡片失败"
+                            f"（重试 {retry + 1}/2）: {e}"
+                        )
+                        publisher._sleep(0.8, minimum_seconds=0.4)
+                    else:
+                        print(f"    -> [调试] 按序号点击卡片失败: {e}")
+        elif _bring_search_card_index_into_dom(
+            publisher,
+            feed_index,
+            replay_scrolls=replay_scrolls,
+        ):
+            publisher._sleep(0.8, minimum_seconds=0.4)
+            if publisher._evaluate(_card_rect_by_index_js(feed_index)):
+                try:
+                    publisher._click_element_by_cdp(
+                        "note card cover by centered index",
+                        _card_rect_by_index_js(feed_index),
+                    )
+                    return True
+                except Exception as e:
+                    print(f"    -> [调试] 按序号居中后点击失败: {e}")
+        print("    -> [调试] 已加载范围内未定位到该序号卡片。")
+        return False
+
+    # 只保留无序号调用的旧 ID 定位兜底。主流程逐条处理时不使用，
+    # 避免在已凑够 post_per_keyword 后继续滚动加载搜索结果。
     if not _seek_card_by_scrolling(publisher, feed_id):
         return False
 
@@ -660,19 +1312,54 @@ def wait_for_detail_state(
     return False
 
 
-def extract_comments_from_dom(publisher: XiaohongshuPublisher) -> list[dict]:
-    """从当前页面浮层/详情页 DOM 中提取评论列表（排除作者评论）。"""
+def _ensure_comments_visible(publisher: XiaohongshuPublisher):
+    """把详情页右侧滚动区域滚到评论区起始位置。"""
     publisher._evaluate("""
         (() => {
-            const root = document.querySelector(
-                ".comments-container, [class*='comments-container'], [class*='comment']"
+            const visible = (el) => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 20
+                    && rect.height > 20
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && rect.right > 0
+                    && rect.left < window.innerWidth;
+            };
+            const scroller = Array.from(document.querySelectorAll(
+                ".note-scroller, [class*='note-scroller']"
+            )).find(visible);
+            const root = Array.from(document.querySelectorAll(
+                ".comments-container, [class*='comments-container']"
+            )).find(visible) || document.querySelector(
+                ".comments-container, [class*='comments-container']"
             );
-            if (root instanceof HTMLElement) {
+            if (scroller instanceof HTMLElement && root instanceof HTMLElement) {
+                const scrollerRect = scroller.getBoundingClientRect();
+                const rootRect = root.getBoundingClientRect();
+                const targetTop = scroller.scrollTop
+                    + rootRect.top
+                    - scrollerRect.top
+                    - 24;
+                scroller.scrollTo({
+                    top: Math.max(targetTop, 0),
+                    behavior: "instant"
+                });
+            } else if (root instanceof HTMLElement) {
                 root.scrollIntoView({ behavior: "instant", block: "center" });
             }
         })()
     """)
     publisher._sleep(1.0, minimum_seconds=0.4)
+
+
+def extract_comments_from_dom(
+    publisher: XiaohongshuPublisher,
+    ensure_visible: bool = True,
+) -> list[dict]:
+    """从当前页面浮层/详情页 DOM 中提取评论列表（排除作者评论）。"""
+    if ensure_visible:
+        _ensure_comments_visible(publisher)
 
     raw = publisher._evaluate("""
         (() => {
@@ -710,6 +1397,11 @@ def extract_comments_from_dom(publisher: XiaohongshuPublisher) -> list[dict]:
                 if (!content) continue;
                 if (content.length < 2 || content.length > 500) continue;
 
+                const locationEl = item.querySelector(
+                    '.date .location, .location, [class*="location"]'
+                );
+                const province = normalize(locationEl ? locationEl.textContent : '');
+
                 const key = id || content.slice(0, 80);
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -720,6 +1412,7 @@ def extract_comments_from_dom(publisher: XiaohongshuPublisher) -> list[dict]:
                 results.push({
                     id: id,
                     content: content,
+                    province: province,
                     is_author: !!isAuthor,
                     userInfo: { nickname: nameEl ? nameEl.textContent.trim() : '' }
                 });
@@ -734,6 +1427,166 @@ def extract_comments_from_dom(publisher: XiaohongshuPublisher) -> list[dict]:
         except json.JSONDecodeError:
             pass
     return []
+
+
+def _comment_key(comment: dict) -> str:
+    """生成跨滚动去重用的评论 key。"""
+    comment_id = str(comment.get("id", "")).strip()
+    if comment_id:
+        return f"id:{comment_id}"
+    content = str(comment.get("content", "")).strip()
+    nickname = str(comment.get("userInfo", {}).get("nickname", "")).strip()
+    province = str(comment.get("province", "")).strip()
+    return f"text:{nickname}:{province}:{content[:80]}"
+
+
+def _scroll_comments_area(
+    publisher: XiaohongshuPublisher,
+    direction: str = "down",
+    pixels: int = 900,
+) -> bool:
+    """滚动详情页右侧 note-scroller 区域，触发更多评论加载。"""
+    sign = -1 if direction == "up" else 1
+    did_scroll = bool(publisher._evaluate(f"""
+        (() => {{
+            const delta = {pixels * sign};
+            const visible = (el) => {{
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 20
+                    && rect.height > 20
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && rect.right > 0
+                    && rect.left < window.innerWidth;
+            }};
+            const target = Array.from(document.querySelectorAll(
+                ".note-scroller, [class*='note-scroller']"
+            )).find((el) => {{
+                if (!visible(el)) return false;
+                return el.scrollHeight > el.clientHeight + 20;
+            }});
+            if (!(target instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const commentsRoot = target.querySelector(
+                ".comments-container, [class*='comments-container']"
+            );
+            if (!(commentsRoot instanceof HTMLElement)) {{
+                return false;
+            }}
+
+            const before = target.scrollTop;
+            target.scrollBy({{ top: delta, behavior: "instant" }});
+            target.dispatchEvent(new WheelEvent("wheel", {{
+                deltaY: delta,
+                bubbles: true,
+                cancelable: true,
+            }}));
+            return target.scrollTop !== before;
+        }})()
+    """))
+    if did_scroll:
+        publisher._sleep(1.0, minimum_seconds=0.5)
+    else:
+        publisher._sleep(0.4, minimum_seconds=0.2)
+    return did_scroll
+
+
+def collect_comments_from_dom(
+    publisher: XiaohongshuPublisher,
+    target_count: int = 100,
+    max_scrolls: int = 18,
+) -> list[dict]:
+    """滚动评论区并累积提取评论，最多返回前 target_count 条。"""
+    collected: list[dict] = []
+    seen: set[str] = set()
+    stagnant_rounds = 0
+
+    for step in range(max_scrolls + 1):
+        current = extract_comments_from_dom(publisher, ensure_visible=(step == 0))
+        before = len(collected)
+        for comment in current:
+            key = _comment_key(comment)
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(comment)
+            if len(collected) >= target_count:
+                return collected[:target_count]
+
+        if len(collected) == before:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+
+        if step >= max_scrolls or stagnant_rounds >= 4:
+            break
+        if not _scroll_comments_area(publisher, direction="down"):
+            break
+
+    return collected[:target_count]
+
+
+def ensure_comment_visible(
+    publisher: XiaohongshuPublisher,
+    target_comment: dict,
+    max_scrolls: int = 18,
+) -> bool:
+    """回复前把已选中的评论滚回当前 DOM 可见区域。"""
+    comment_id = str(target_comment.get("id", "")).strip()
+    content = str(target_comment.get("content", "")).strip()
+    snippet = content[:60]
+    id_literal = json.dumps(comment_id, ensure_ascii=False)
+    snippet_literal = json.dumps(snippet, ensure_ascii=False)
+
+    find_js = f"""
+        (() => {{
+            const targetId = {id_literal};
+            const snippet = {snippet_literal};
+            const normalize = (text) => (text || "").replace(/\\s+/g, " ").trim();
+            const items = document.querySelectorAll(
+                '.comment-item, .parent-comment, [class*="comment-item"], [class*="parent-comment"]'
+            );
+            for (const item of items) {{
+                if (!(item instanceof HTMLElement)) continue;
+                const rawId = (
+                    item.id ||
+                    item.getAttribute('data-comment-id') ||
+                    item.getAttribute('comment-id') ||
+                    item.dataset.commentId ||
+                    ''
+                ).replace(/^comment-/, '');
+                const text = normalize(item.textContent);
+                const matched = targetId
+                    ? rawId === targetId
+                    : (snippet && text.includes(snippet));
+                if (matched) {{
+                    item.scrollIntoView({{
+                        behavior: "instant",
+                        block: "center",
+                        inline: "nearest"
+                    }});
+                    return true;
+                }}
+            }}
+            return false;
+        }})()
+    """
+
+    if publisher._evaluate(find_js):
+        publisher._sleep(0.5, minimum_seconds=0.2)
+        return True
+
+    for direction in ("up", "down"):
+        for _ in range(max_scrolls):
+            if not _scroll_comments_area(publisher, direction=direction):
+                break
+            if publisher._evaluate(find_js):
+                publisher._sleep(0.5, minimum_seconds=0.2)
+                return True
+    return False
 
 
 def close_detail_overlay(publisher: XiaohongshuPublisher):
@@ -824,10 +1677,13 @@ def main():
         sys.exit(1)
 
     service_name = profile.get("service_name", profile_name)
+    target_provinces = get_target_provinces(profile)
 
     print("=" * 60)
     print(f"  小红书评论自动回复机器人 (通用版 · 无限模式)")
     print(f"  当前业务: {service_name} [profile={profile_name}]")
+    if target_provinces:
+        print(f"  目标省份: {', '.join(target_provinces)}")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
 
@@ -913,6 +1769,21 @@ def main():
                     print("  -> 未找到任何笔记，跳过。")
                     continue
 
+                search_load_scrolls = 0
+                if len(feeds) < post_per_keyword:
+                    feeds, search_load_scrolls = load_more_search_feeds(
+                        publisher,
+                        feeds,
+                        target_count=post_per_keyword,
+                    )
+                else:
+                    feeds = _sort_feeds_by_dom_index(
+                        _merge_feeds(
+                            feeds,
+                            _extract_search_feeds_from_dom(publisher),
+                        )
+                    )
+
                 top_feeds = feeds[:post_per_keyword]
                 print(f"  -> 找到 {len(feeds)} 篇笔记，处理前 {len(top_feeds)} 篇。\n")
 
@@ -940,7 +1811,11 @@ def main():
                     comment_count = parse_comment_count(comment_count_str)
                     comment_count_unknown = bool(feed.get("_commentCountUnknown"))
 
-                    if not comment_count_unknown and comment_count < min_comment_count:
+                    if (
+                        not target_provinces
+                        and not comment_count_unknown
+                        and comment_count < min_comment_count
+                    ):
                         print(
                             f"    -> [跳过] 评论数不足 "
                             f"({comment_count} < {min_comment_count})。"
@@ -957,45 +1832,96 @@ def main():
                         f"    -> 评论数: {'未知，打开详情后校验' if comment_count_unknown else comment_count}。"
                         f"正在打开笔记详情..."
                     )
+                    feed_dom_index = (
+                        feed.get("_domIndex")
+                        if isinstance(feed.get("_domIndex"), int)
+                        else feed_idx - 1
+                    )
 
                     try:
                         if not click_note_card(
                             publisher,
                             feed_id,
-                            feed_index=feed_idx - 1,
+                            feed_index=feed_dom_index,
+                            replay_scrolls=search_load_scrolls,
                         ):
-                            print("    -> 笔记卡片初次点击失败。尝试向下翻页并重试...")
-                            _scroll_search_page(publisher, pixels=800)
-                            if not click_note_card(
-                                publisher,
-                                feed_id,
-                                feed_index=0,
-                            ):
-                                print("    -> [跳过] 重试点击依然失败。")
-                                total_skipped += 1
-                                continue
-
-                        publisher._sleep(2.0, minimum_seconds=1.0)
-                        if not wait_for_detail_state(publisher, feed_id, timeout=10.0):
-                            print("    -> [跳过] 详情加载超时。")
-                            close_detail_overlay(publisher)
+                            print("    -> [跳过] 已加载搜索结果范围内未定位到该笔记卡片。")
                             total_skipped += 1
                             continue
 
-                        actual_comments = extract_comments_from_dom(publisher)
-
-                        if len(actual_comments) < min_comment_count:
+                        publisher._sleep(2.0, minimum_seconds=1.0)
+                        if not wait_for_detail_state(publisher, feed_id, timeout=10.0):
                             print(
-                                f"    -> [跳过] 实际可见评论不足 "
-                                f"({len(actual_comments)} < {min_comment_count})。"
+                                "    -> [警告] 详情加载超时，"
+                                "从页首重放补加载滚动后重试打开..."
+                            )
+                            close_detail_overlay(publisher)
+                            if not click_note_card(
+                                publisher,
+                                feed_id,
+                                feed_index=feed_dom_index,
+                                replay_scrolls=search_load_scrolls,
+                                force_replay=True,
+                            ):
+                                print("    -> [跳过] 重放滚动后仍未定位到该笔记卡片。")
+                                total_skipped += 1
+                                continue
+                            publisher._sleep(2.0, minimum_seconds=1.0)
+                            if not wait_for_detail_state(publisher, feed_id, timeout=10.0):
+                                print("    -> [跳过] 重试后详情仍加载超时。")
+                                close_detail_overlay(publisher)
+                                total_skipped += 1
+                                continue
+
+                        if target_provinces:
+                            print("    -> 已配置目标省份，滚动加载前 100 条评论用于筛选...")
+                            actual_comments = collect_comments_from_dom(
+                                publisher,
+                                target_count=100,
+                            )
+                        else:
+                            actual_comments = extract_comments_from_dom(publisher)
+
+                        candidate_comments = filter_comments_by_target_provinces(
+                            actual_comments,
+                            target_provinces,
+                        )
+                        if target_provinces:
+                            skipped_by_province = (
+                                len(actual_comments) - len(candidate_comments)
+                            )
+                            print(
+                                f"    -> 省份过滤: 保留 {len(candidate_comments)} 条 "
+                                f"({', '.join(target_provinces)})，"
+                                f"忽略 {skipped_by_province} 条其他省份评论。"
+                            )
+
+                        if target_provinces:
+                            if not candidate_comments:
+                                print(
+                                    f"    -> [跳过] 前 {len(actual_comments)} 条评论中"
+                                    f"没有目标省份评论。"
+                                )
+                                close_detail_overlay(publisher)
+                                total_skipped += 1
+                                continue
+                        elif len(candidate_comments) < min_comment_count:
+                            print(
+                                f"    -> [跳过] 可分析评论不足 "
+                                f"({len(candidate_comments)} < {min_comment_count})。"
                             )
                             close_detail_overlay(publisher)
                             total_skipped += 1
                             continue
 
-                        comments_to_analyze = actual_comments[:analyze_comment_count]
+                        comments_to_analyze = (
+                            candidate_comments
+                            if target_provinces
+                            else candidate_comments[:analyze_comment_count]
+                        )
                         print(
                             f"    -> 提取到 {len(actual_comments)} 条评论，"
+                            f"候选 {len(candidate_comments)} 条，"
                             f"取前 {len(comments_to_analyze)} 条送 LLM 分析..."
                         )
 
@@ -1038,6 +1964,7 @@ def main():
                         user_name = target_comment.get("userInfo", {}).get(
                             "nickname", "未知用户"
                         )
+                        target_comment_province = target_comment.get("province", "")
                         target_comment_id = target_comment.get("id")
                         reply_content = llm_result.get("generated_reply", "")
 
@@ -1049,9 +1976,19 @@ def main():
 
                         print(f"\n    🎯 发现潜在客户:")
                         print(f"       用户: {user_name}")
+                        if target_comment_province:
+                            print(f"       省份: {target_comment_province}")
                         print(f"       评论: {target_comment.get('content')}")
                         print(f"       原因: {llm_result.get('reason')}")
                         print(f"       回复: {reply_content}\n")
+
+                        if target_provinces:
+                            print("    -> 正在定位目标评论，确保回复按钮可见...")
+                            if not ensure_comment_visible(publisher, target_comment):
+                                print("    -> [跳过] 未能把目标评论滚动到可见区域。")
+                                close_detail_overlay(publisher)
+                                total_skipped += 1
+                                continue
 
                         print("    -> 正在发送回复...")
                         if not xsec_token:
@@ -1083,6 +2020,7 @@ def main():
                             "note_title": title,
                             "note_id": feed_id,
                             "target_user": user_name,
+                            "target_comment_province": target_comment_province,
                             "target_comment_id": target_comment_id,
                             "original_comment": target_comment.get("content"),
                             "ai_reason": llm_result.get("reason"),
@@ -1095,6 +2033,7 @@ def main():
                         cache[feed_id] = {
                             "title": title,
                             "target_user": user_name,
+                            "target_comment_province": target_comment_province,
                             "comment_id": target_comment_id,
                             "status": reply_status,
                             "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),

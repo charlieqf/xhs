@@ -78,8 +78,8 @@ metadata:
 ### 工作原理
 
 1. 通用版 `prod/general_comment_bot.py <profile>` 优先使用 LLM 生成搜索关键词；失败时回退到 profile 静态关键词库。LLM 的 system/user 提示词统一配置在 `prod/profiles/<profile>.json` 的 `llm_prompts` 中。旧版 `prod/comment_bot.py` 从 `keywords.json` 展开关键词（`{city}`/`{platform}`/`{sports}` 占位符替换 + 通用关键词随机抽取）。
-2. 遍历关键词搜索小红书笔记。
-3. 对每篇笔记提取 DOM 评论，送 LLM（OpenRouter Gemini）分析相亲意向。
+2. 遍历关键词搜索小红书笔记；若搜索结果少于 `post_per_keyword`，先滚动搜索结果区域加载更多笔记，再回到页首逐条处理。
+3. 对每篇笔记提取 DOM 评论；若 profile 配置了 `target_provinces`，滚动加载前 100 条评论后按评论位置省份过滤，筛选结果至少 1 条即可送 LLM（OpenRouter Gemini）分析业务意向。
 4. 有意向时自动回复该评论（≤50字），无意向则跳过。
 5. 缓存机制避免重复回复，结果保存在 `prod/` 目录。
 
@@ -109,6 +109,7 @@ python prod/general_comment_bot.py medical_beauty
 | `llm_prompts.keyword_user` | 关键词生成 user prompt |
 | `llm_prompts.comment_system` | 评论分析 system prompt |
 | `llm_prompts.comment_user` | 评论分析 user prompt |
+| `target_provinces` | 可选，目标省份列表；配置后滚动加载前 100 条评论，只分析并回复这些省份的评论，筛选结果至少 1 条即可分析 |
 
 `llm_prompts` 使用 `${变量名}` 模板。关键词提示词可引用 `service_name`、`business_topic`、`intent_terms`、`batch_size`、`sample_keywords_json`、`recent_used_json`；评论提示词可引用 `service_desc`、`intent_terms`、`reply_style`、`reply_max_chars`、`comments_text`、`comments_count`。
 

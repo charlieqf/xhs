@@ -20,6 +20,8 @@
 - **内容检索与详情读取**：支持搜索笔记并获取指定笔记详情（含评论数据），详情可选滚动加载更多评论/回复
 - **笔记评论**：支持按 `feed_id + xsec_token` 对指定笔记发表一级评论
 - **评论回复**：支持按评论定位条件（评论 ID / 作者 / 文本片段）回复指定评论
+- **评论省份过滤**：通用评论机器人支持读取 profile 的 `target_provinces`，只分析和回复目标省份评论
+- **搜索结果补加载**：通用评论机器人会在搜索结果少于 `post_per_keyword` 时滚动加载更多笔记，再回到页首逐条处理
 - **互动动作控制**：支持对指定笔记执行点赞/取消点赞、收藏/取消收藏
 - **用户页信息提取**：支持抓取用户主页快照与主页笔记列表
 - **通知评论抓取**：支持在 `/notification` 页面抓取 `you/mentions` 接口返回
@@ -212,7 +214,8 @@ python scripts/cdp_publish.py get-notification-mentions
 
 说明：`list-feeds` 返回首页推荐 feed 列表；`search-feeds` 每个关键词都会切换到新的小红书首页标签页并关闭旧搜索标签页，再通过搜索框输入关键词并点击搜索图标拉取 feed 列表，避免直接跳转搜索 URL 触发风控或关键词切换异常。
 说明：若搜索结果页没有刷新 `window.__INITIAL_STATE__`，脚本会从已渲染的结果卡片 DOM 兜底提取笔记 ID 与 `xsec_token`；此时列表页评论数可能显示为未知，机器人会打开详情后再校验真实可见评论数。
-说明：评论机器人打开笔记后会兼容详情页浮层，若详情 state 未刷新，会以详情/评论 DOM 可见作为加载成功，并滚动到评论区后提取评论。
+说明：若通用评论机器人搜索到的笔记数少于 `post_per_keyword`，会先滚动 `.feeds-container` 所在搜索结果区域触发懒加载，合并更多笔记后回到页首再开始处理。
+说明：评论机器人打开笔记后会兼容详情页浮层，若详情 state 未刷新，会以详情/评论 DOM 可见作为加载成功，并滚动到评论区后提取评论；若 profile 配置了 `target_provinces`，会滚动加载前 100 条评论后按评论位置省份过滤，筛选结果只要至少 1 条就进入 LLM 分析。
 说明：评论机器人在已打开的详情浮层内回复时，会直接使用当前页面上下文；只有需要重新导航详情页时才强制要求 `xsec_token`。
 说明：`get-feed-detail --load-all-comments` 会在详情页滚动评论区，并可选点击“更多回复”后再提取 `window.__INITIAL_STATE__`。
 
@@ -393,6 +396,7 @@ python prod/general_comment_bot.py medical_beauty
 - `config`：关键词数量、评论门槛、延迟等运行参数。
 - `keywords`：静态关键词、模板关键词、占位符池。
 - `llm_prompts`：LLM 提示词配置，包含 `keyword_system`、`keyword_user`、`comment_system`、`comment_user`。
+- `target_provinces`：可选省份白名单；配置后会滚动加载前 100 条评论，只分析和回复这些省份的评论，其他省份评论会被忽略；筛选结果不受 `min_comment_count` 限制，至少 1 条即可分析。
 
 `llm_prompts` 支持 `${变量名}` 模板变量。关键词生成可用 `service_name`、`business_topic`、`intent_terms`、`batch_size`、`sample_keywords_json`、`recent_used_json`；评论分析可用 `service_desc`、`intent_terms`、`reply_style`、`reply_max_chars`、`comments_text`、`comments_count`。
 
