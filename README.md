@@ -405,6 +405,7 @@ python prod/general_comment_bot.py medical_beauty
 输出：
 - `prod/comment_responses/comment_responses*.json`：回复记录
 - `prod/comment_responses/comment_report_*.html`：`python prod/comment_count.py` 生成的统计报告
+- `python prod/comment_count_lite.py`：直接输出 `date,count` 两列每日回复统计，并在末尾追加 `summary`
 - `prod/processed_cache.json`：已处理缓存
 
 ## RoadMap
