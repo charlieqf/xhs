@@ -11,7 +11,7 @@
 1. **跨账号内容 DNA 高度同质化**——profile 里写死的 service 介绍 + intent terms + 同一 LLM/同一 system prompt，是 2026 年 XHS 风控的头号封号轴线。
 2. **没有任何账号级速率上限**——`while True:` 循环 + `random.uniform` 延时，单号每天可发 200+ 条评论，远超人类基线；也没有"账号收警告就冻结"的状态机。
 3. **没有软封反馈环**——评论失败/被屏蔽/零曝光都不会触发账号侧的暂停，dead account 会被持续锤击直到硬封。
-4. **CDP 协议层风险被业界讨论**——但本仓库**未启用** `Runtime.enable` / `Console.enable`，仅启用 `Page.enable` / `Network.enable` / `DOM.enable`，原始审阅中针对前两者的指控不成立；剩余风险面较窄。
+4. **CDP 协议层残留风险面较窄**——本仓库未启用 `Runtime.enable` / `Console.enable`，仅启用 `Page.enable` / `Network.enable` / `DOM.enable`，避开了业界讨论较多的两条协议层泄漏；attach 模式固有的 `debugger;` 检测无解，作为已知 trade-off 接受。
 5. **点击前置动作缺失，延时分布有统计学指纹**——点击已派发 `mousePressed` + `mouseReleased`（不是"鬼点"），但缺少 `mouseMoved` 前置轨迹、缺少 press/release 之间的人类停顿、缺少坐标随机偏移；`random.uniform` 延时分布与真人对数正态分布差异明显。
 
 ## 关键背景：2026 年 XHS 风控环境变化
@@ -72,20 +72,23 @@
   - **注**：上述阈值（3-5 条/天）为社区方向性共识，本项目未独立验证。下方 `day=5、week=25` 是据此定的起步值，不是通过实测得到。
 - **影响**：与问题 1 叠加，是当前架构下封号的两条最快路径。
 - **改进**：
-  - 第一阶段先做最小可用 schema，避免过度设计：
+  - 第一阶段最小可用 schema，避免过度设计：
     ```json
     {
       "<account_name>": {
         "day_count": 0,
         "day_started_at": "2026-05-09T00:00:00",
         "day_limit": 5,
+        "last_action_at": null,
+        "min_action_interval_sec": 1800,
         "frozen_until": null
       }
     }
     ```
-    每条评论发出前 check `day_count < day_limit` 且 `now > frozen_until`；命中即跳过该账号所有任务。
+    每条评论发出前 check：`day_count < day_limit` 且 `now > frozen_until` 且 `now - last_action_at >= min_action_interval_sec`。三条全过才放行。
+  - **`min_action_interval_sec` 不可省**：`day_limit=5` + `keyword_delay_min=30` + `post_delay_min=10` 跑下来，5 条评论会集中在 ~6 分钟窗口内完成，剩下 23h54m 静默——这种 burst 本身就是机器节律。强制 ≥30 分钟（甚至更长）的最小操作间隔，把 5 条打散到一天里。
   - 第二阶段再补 `hour` / `week` 维度、`warning_count`、`last_warning_at`、软封计数。
-  - `bot_lite.py:213-230` 的两档检测改为：命中即累计 `warning_count++`，1 次冻结 24h，2 次冻结 7 天，3 次永久退役；同时把这套逻辑泛化到 `comment_bot.py`。
+  - `bot_lite.py:213-230` 的两档检测接入 warning 累计阶梯：1 次 4-6h（接续现有 60-180s 短冷却之后转长冷却）→ 2 次 24h → 3 次 7d → 4 次永久退役；同时把这套逻辑泛化到 `comment_bot.py`。`error_code=300013` 偶发命中也可能是真人手快，不要一次就重判 24h。
   - **同步收紧 delay 下限**：把 `prod/config.json` 的 `keyword_delay_min` 从 3 拉到 ≥30，`post_delay_min` 从 2 拉到 ≥10，与养号节奏对齐。否则单加配额、不动 delay，跑出来的节奏依然是"激进 + 早停"，不是"舒缓"。
 
 ### 3. 软封反馈环不完整（P1）
@@ -107,14 +110,13 @@
 
 ### 4. CDP 协议启用面残留风险（P2）
 
-- **严重级别：中（投入产出比偏低，建议在前三阶段完成后再评估）**
-- **位置**：`scripts/cdp_publish.py:608, 866-867, 967, 1103, 1143, 1546, 3337-3338, 3486`（启用 `Page.enable` / `Network.enable` / `DOM.enable` 的调用点）；`scripts/cdp_publish.py:946`（`Runtime.evaluate` 调用）
+- **严重级别：低-中（无必做项，全部归入可选 / 观测）**
+- **位置**：`scripts/cdp_publish.py:608, 866-867, 967, 1103, 1143, 1546, 3337-3338, 3486`（启用 `Page.enable` / `Network.enable` / `DOM.enable` 的调用点）
 - **剩余风险面**：
-  - **`Page.enable` / `Network.enable` / `DOM.enable` 在 attach 模式下的可检测性**：业界对这三者的检测讨论远少于 `Runtime.enable`，但理论上 `Page.frameNavigated` 等回调注册会改变某些时序特征。是否被 XHS 检测——目前没有公开证据，建议作为观测项而非 audit 目标。
-  - **`Runtime.evaluate` 的 stack-trace 暴露**：通过 `Runtime.evaluate` 注入的脚本若抛错，stack 中可能出现非预期的源信息。当前 `cdp_publish.py:946` 的调用点需要确认：(a) 注入脚本是否包裹 try/catch，(b) 异常是否回流到页面侧。
-  - **裸 websocket 客户端 vs Patchright**：项目用裸 CDP 而非 Patchright，意味着如果未来需要启用 `Runtime.enable`（例如做事件监听），需手工实现泄漏修补。
-- **改进**（按必要性排序，多数为可选）：
-  - **必做**：在 `Runtime.evaluate` 调用点统一加 try/catch wrapper，确保异常不回流到页面侧。
+  - **`Page.enable` / `Network.enable` / `DOM.enable` 在 attach 模式下的可检测性**：业界对这三者的检测讨论远少于 `Runtime.enable`，但理论上 `Page.frameNavigated` 等回调注册会改变某些时序特征。目前没有公开证据指向 XHS 检测这条，建议作为观测项。
+  - **attach 模式固有的 `debugger;` 检测无解**：页面侧主动 `try { debugger; } catch (e) { /* 检查 e.stack 或执行时延 */ }` 可以判定 Chrome 是否被 attach。这跟项目是否启用某个 CDP domain、是否调用 `Runtime.evaluate` 都无关，只要继续用 attach 模式就盖不住。**这是 attach 路线的固有 trade-off，作为已知风险接受**——切换路线（如全 launch + Patchright）才能盖住，但代价远高于收益。
+  - **裸 websocket 客户端 vs Patchright**：项目用裸 CDP 而非 Patchright，意味着如果未来真的需要启用 `Runtime.enable`（例如做事件监听），需手工实现泄漏修补。当前没有这个需求，留作设计空间。
+- **改进**（全部为可选 / 观测，无必做项）：
   - **可选**：增加自检脚本——在 `xiaohongshu.com` 上跑一组指纹检测页面（如 bot.sannysoft.com、antoinevastel.com/bots），对比真实 Chrome 与本工具运行下的结果，作为回归测试。
   - **不建议短期内做**：迁移到 Patchright `connect_over_cdp`。`cdp_publish.py` 全文 5000 行，迁移成本高；当前协议启用面已经很小，ROI 不足。
 
@@ -130,10 +132,8 @@
 - **证据**：xiaohongshu-mcp issue #674 的 ccmagia2-gif 评论明确指出"行为节律是当前主要剩余检测面"；但贝塞尔曲线 vs 直线在浏览器端因 mousemove 节流到 ~60Hz，区分度不如预期。
 - **影响**：单看一次操作不致命；但与问题 2 的高频叠加，会形成稳定的"机器节律"画像。
 - **改进**（按 ROI 排序，不必全做）：
-  - **必做**：补全 `_click_element_by_cdp` 的前置动作——
-    1. 先派发 `mouseMoved` 到目标坐标附近（带 ±5~10 像素随机偏移）；
-    2. press 与 release 之间从固定 50ms 改为 80-300ms 随机停顿；
-    3. 最终点击坐标也加 ±N 像素抖动，不要每次都打元素正中心。
+  - **必做（落地路径仅 1 行代码）**：项目里已有现成的 `_move_mouse`（`scripts/cdp_publish.py:4103-4109`，派发单条 `mouseMoved`），但没有被 `_click_element_by_cdp` 调用。在 `cdp_publish.py:4147` 派发 `mousePressed` 之前补一句 `self._move_mouse(cx + offset_x, cy + offset_y)`（offset 取 ±5~10 像素随机），并把同处的 `cx, cy` 也加 ±N 像素抖动，不要每次打元素正中心。
+  - **必做**：press 与 release 之间从固定 50ms（`cdp_publish.py:4121, 4155`）改为 80-300ms 随机停顿。
   - **必做**：延时分布从 `random.uniform` 改为 `random.lognormvariate(mu, sigma)`，参数按真人滚动数据拟合（mu≈1.0, sigma≈0.6 起步）。
   - **可选**：每 5-10 个目标操作中插入 1 次"假动作"——随机滑两屏、点开一个无关笔记、3-8 秒后退回。
   - **可选**：`window.scrollBy` 改为分帧 `requestAnimationFrame` 滚动，带 ease-out 曲线。
@@ -169,11 +169,14 @@
 
 ### 第一阶段（1-2 天，立即做，封号风险下降一个数量级）
 
-- [ ] **#2** 引入 `account_state.json` 最小 schema：仅 `day_count` + `day_limit` + `frozen_until`（三层窗口留到第二阶段）；起步 `day_limit=5`
+- [ ] **#2** 引入 `account_state.json` 最小 schema：`day_count` + `day_limit` + `last_action_at` + `min_action_interval_sec` + `frozen_until`；起步 `day_limit=5`、`min_action_interval_sec=1800`（≥30 分钟，避免 5 条挤在 6 分钟窗口里）
 - [ ] **#2** 把 `prod/config.json` 的 `keyword_delay_min` 拉到 ≥30、`post_delay_min` 拉到 ≥10，与养号节奏对齐
-- [ ] **#2/#3** 把 `bot_lite.py:213-230` 的两档 URL 检测泛化到 `comment_bot.py` / `general_comment_bot.py`，并接入 warning 累计：1 次 24h、2 次 7d、3 次永久退役
-- [ ] **#3** 评论后 30-60s 回查可见性，3 次不可见即冻结
+- [ ] **#2/#3** 把 `bot_lite.py:213-230` 的两档 URL 检测泛化到 `comment_bot.py` / `general_comment_bot.py`，并接入 warning 阶梯：1 次 4-6h、2 次 24h、3 次 7d、4 次永久退役
 - [ ] **#6** 砍掉 `prod/*.py` 入口的 `--headless` 参数，调用处写死 `headless=False`
+
+### 第一阶段补充（3-5 天，单独验证，避免拖垮主线）
+
+- [ ] **#3** 评论后 30-60s 回查可见性，3 次不可见即冻结。这一项含回查时机调度、评论列表 DOM 匹配 user_id + 文本前缀、连续 N 次状态机、失败计数持久化四个子项，单独花的时间接近 3-5 天，不要塞在第一阶段里跟主线一起跑。
 
 ### 第二阶段（3-5 天，对抗内容相似度风控）
 
