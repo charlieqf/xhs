@@ -5,6 +5,7 @@
 使用 Playwright 操作现有的 CDP 浏览器实例。
 """
 
+import argparse
 import sys
 import os
 import json
@@ -32,6 +33,12 @@ if os.path.exists(env_path):
                 os.environ[key.strip()] = value.strip().strip("'\"")
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("api_key", "")
+
+# 反检测模块（账号配额 + 风控信号）
+import account_state
+import risk_control
+from account_manager import get_default_account
+from run_lock import single_instance, SingleInstanceError
 
 # 检查依赖
 try:
@@ -210,24 +217,30 @@ def evaluate_comments_with_llm(comments: list[dict]) -> dict | None:
 #  主逻辑
 # ============================================================
 
-def _check_rate_limit(page) -> bool:
-    """检测是否被限流，如果是则等待并恢复。返回 True 表示触发了限流。"""
-    url = page.url
-    if "error_code=300013" in url or "error_msg" in url:
-        wait_time = random.uniform(60, 120)
-        print(f"  ⚠️ [限流] 检测到访问频繁限制，等待 {wait_time:.0f} 秒后恢复...")
-        time.sleep(wait_time)
+def _check_rate_limit(page, account: str) -> bool:
+    """检测当前 URL 是否含 风控 重定向信号。
+
+    命中即调 ``risk_control.check_and_record`` → ``account_state.record_warning``,
+    按 warning 阶梯写入 ``frozen_until``（4-6h / 24h / 7d / 永久）。
+    本函数只标记 + 短暂回到 explore 页恢复，长冷却由 ``account_state.can_send``
+    在下一次发送前自动拦截，不再靠这里 sleep 60-180s。
+
+    返回 True 表示触发了风控。
+    """
+    signal = risk_control.check_and_record(account, page.url)
+    if signal is None:
+        return False
+    kind, count, frozen_until = signal
+    print(
+        f"  ⚠️ [风控] {kind}: 第 {count} 次警告，账号冻结至 {frozen_until}"
+    )
+    # 回到 explore 摆脱错误页，但不再硬 sleep——下一次 can_send 检查会自然拦截
+    try:
         page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
         time.sleep(random.uniform(5, 10))
-        return True
-    if "website-login/error" in url:
-        wait_time = random.uniform(90, 180)
-        print(f"  ⚠️ [风控] 被重定向到错误页，等待 {wait_time:.0f} 秒后恢复...")
-        time.sleep(wait_time)
-        page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
-        time.sleep(random.uniform(5, 10))
-        return True
-    return False
+    except Exception:
+        pass
+    return True
 
 def _human_delay(min_s: float = 2.0, max_s: float = 5.0):
     """模拟人类操作间隔"""
@@ -247,11 +260,42 @@ def _save_results(all_responses: list[dict], total_replies: int, round_number: i
     print(f"\n✅ 第 {round_number} 轮结果已保存: {file_path}")
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="小红书评论自动回复机器人 (Lite Playwright 版)",
+    )
+    parser.add_argument(
+        "--account",
+        default=None,
+        help="账号名（对应 prod/account_state/<name>.json + Chrome profile）；"
+        "省略则用 account_manager 的默认账号",
+    )
+    args = parser.parse_args()
+    account = args.account or get_default_account()
+
     print("=" * 60)
     print("  小红书评论自动回复机器人 (Lite Playwright 版)")
+    print(f"  账号: {account}")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
 
+    # 起步即检查账号 state，如果已永久退役直接退出，避免连 Chrome 都白连
+    state = account_state.load(account)
+    if state.get("frozen_until") == account_state.PERMANENT_FREEZE_ISO:
+        print(f"⛔ 账号 {account} 已永久退役，bot 拒绝启动。")
+        sys.exit(1)
+    allowed, reason = account_state.can_send(account)
+    if not allowed:
+        print(f"⚠️ 账号 {account} 当前不可发送：{reason}（bot 仍会启动并等待间隔解除/冻结到期）")
+
+    try:
+        with single_instance(f"xhs_account_{account}"):
+            _run_main(account)
+    except SingleInstanceError as e:
+        print(f"⛔ {e}")
+        sys.exit(1)
+
+
+def _run_main(account: str):
     config = load_config()
     keywords_data = load_keywords()
     cache = load_cache()
@@ -295,7 +339,7 @@ def main():
                     print(f"\n{'─' * 50}\n[第{round_number}轮 {kw_idx}/{len(keywords)}] 🔍 搜索关键词: 「{keyword}」")
                     
                     # 检测限流
-                    _check_rate_limit(page)
+                    _check_rate_limit(page, account)
                     
                     # 回到探索页，确保我们在一致的状态且不易被阻断
                     if "explore" not in page.url and "search" not in page.url:
@@ -324,7 +368,7 @@ def main():
                         page.wait_for_selector("section.note-item, a.title", timeout=15000)
                     except PlaywrightTimeout:
                         print("  -> [跳过] 结果加载超时或没有结果。")
-                        if _check_rate_limit(page):
+                        if _check_rate_limit(page, account):
                             continue
                         continue
 
@@ -362,7 +406,7 @@ def main():
                             # 详情页出现
                             page.wait_for_selector(".comment-item, .note-container, .note-detail-mask", timeout=10000)
                             _human_delay(2, 5)  # 模拟阅读笔记内容
-                            if _check_rate_limit(page):
+                            if _check_rate_limit(page, account):
                                 continue
                         except Exception as e:
                             print(f"    -> 点击卡片或等待详情页失败: {e}")
@@ -423,6 +467,19 @@ def main():
                         print(f"       评论: {target_comment['content']}")
                         print(f"       准备回复: {reply_content}\n")
 
+                        # 反检测配额检查：发送前再次确认账号没冻结、没超日量、间隔够
+                        allowed, reason = account_state.can_send(account)
+                        if not allowed:
+                            state = account_state.load(account)
+                            if state.get("frozen_until") == account_state.PERMANENT_FREEZE_ISO:
+                                print(f"    ⛔ 账号已永久退役（{reason}），bot 退出。")
+                                page.keyboard.press("Escape")
+                                return
+                            print(f"    ⏸ 跳过发送：{reason}")
+                            page.keyboard.press("Escape")
+                            time.sleep(1)
+                            continue
+
                         try:
                             # 1. 悬停并点击回复按钮
                             target_element.hover()
@@ -447,6 +504,7 @@ def main():
                             send_btn = page.locator("button.btn.submit").first
                             send_btn.click()
                             print("    -> ✅ 回复操作已模拟完成！")
+                            account_state.record_send(account)
                             total_replies += 1
 
                             # 记录结果

@@ -7,6 +7,8 @@
     python prod/comment_bot.py
 """
 
+import argparse
+import atexit
 import sys
 import os
 import json
@@ -35,6 +37,12 @@ if os.path.exists(env_path):
                 os.environ[key.strip()] = value.strip().strip("'\"")
 
 from cdp_publish import XiaohongshuPublisher
+
+# 反检测模块（账号配额 + 风控信号）
+import account_state
+import risk_control
+from account_manager import get_default_account
+from run_lock import single_instance, SingleInstanceError
 
 OPENROUTER_API_KEY = (
     os.environ.get("OPENROUTER_API_KEY")
@@ -773,10 +781,41 @@ def _save_results(all_responses: list[dict], total_replies: int, total_skipped: 
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="小红书评论自动回复机器人 (生产版 · 无限模式)",
+    )
+    parser.add_argument(
+        "--account",
+        default=None,
+        help="账号名（对应 prod/account_state/<name>.json + Chrome profile）；"
+        "省略则用 account_manager 的默认账号",
+    )
+    args = parser.parse_args()
+    account = args.account or get_default_account()
+
     print("=" * 60)
     print("  小红书评论自动回复机器人 (生产版 · 无限模式)")
+    print(f"  账号: {account}")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
+
+    # 起步即检查账号 state，已永久退役直接退出
+    state = account_state.load(account)
+    if state.get("frozen_until") == account_state.PERMANENT_FREEZE_ISO:
+        print(f"⛔ 账号 {account} 已永久退役，bot 拒绝启动。")
+        sys.exit(1)
+    allowed, reason = account_state.can_send(account)
+    if not allowed:
+        print(f"⚠️ 账号 {account} 当前不可发送：{reason}（bot 仍会启动并等待间隔/冻结到期）")
+
+    # 按账号粒度的 single-instance 锁；防止两个 bot 同时操作同一账号导致双发
+    _lock_ctx = single_instance(f"xhs_account_{account}")
+    try:
+        _lock_ctx.__enter__()
+    except SingleInstanceError as e:
+        print(f"⛔ {e}")
+        sys.exit(1)
+    atexit.register(_lock_ctx.__exit__, None, None, None)
 
     # --- 加载配置 ---
     config = load_config()
@@ -1012,6 +1051,31 @@ def main():
                         print(f"       原因: {llm_result.get('reason')}")
                         print(f"       回复: {reply_content}\n")
 
+                        # 反检测：发送前先看 URL 是否已被风控重定向、账号是否可发
+                        try:
+                            current_url = publisher._evaluate("window.location.href")
+                        except Exception:
+                            current_url = None
+                        rc_signal = risk_control.check_and_record(account, current_url)
+                        if rc_signal is not None:
+                            kind, count, frozen_until = rc_signal
+                            print(f"    ⚠️ [风控] {kind}: 第 {count} 次警告，冻结至 {frozen_until}")
+                            close_detail_overlay(publisher)
+                            total_skipped += 1
+                            continue
+
+                        allowed, reason = account_state.can_send(account)
+                        if not allowed:
+                            cur_state = account_state.load(account)
+                            if cur_state.get("frozen_until") == account_state.PERMANENT_FREEZE_ISO:
+                                print(f"    ⛔ 账号已永久退役（{reason}），bot 退出。")
+                                close_detail_overlay(publisher)
+                                return
+                            print(f"    ⏸ 跳过发送：{reason}")
+                            close_detail_overlay(publisher)
+                            total_skipped += 1
+                            continue
+
                         # 5. 自动回复
                         print("    -> 正在发送回复...")
                         if not xsec_token:
@@ -1025,8 +1089,19 @@ def main():
                                 skip_navigation=True,
                             )
                             print("    -> ✅ 回复发送成功！")
+                            account_state.record_send(account)
                             reply_status = "success"
                             total_replies += 1
+
+                            # 发送后再 check 一次 URL，捕捉发送之后的 风控 重定向
+                            try:
+                                post_url = publisher._evaluate("window.location.href")
+                            except Exception:
+                                post_url = None
+                            post_signal = risk_control.check_and_record(account, post_url)
+                            if post_signal is not None:
+                                kind, count, frozen_until = post_signal
+                                print(f"    ⚠️ [风控] 发送后 {kind}: 第 {count} 次警告，冻结至 {frozen_until}")
 
                             # 5b. 给笔记点赞，方便后续在「我的赞」中找到已回复的笔记
                             try:
