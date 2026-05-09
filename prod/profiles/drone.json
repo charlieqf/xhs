@@ -20,12 +20,12 @@
         "min_comment_count": 5,
         "analyze_comment_count": 10,
         "post_per_keyword": 10,
-        "keyword_delay_min": 8,
-        "keyword_delay_max": 15,
-        "post_delay_min": 2,
-        "post_delay_max": 5,
-        "round_delay_min": 15,
-        "round_delay_max": 30
+        "keyword_delay_min": 30,
+        "keyword_delay_max": 60,
+        "post_delay_min": 10,
+        "post_delay_max": 25,
+        "round_delay_min": 60,
+        "round_delay_max": 120
     },
     "keywords": {
         "special_keywords": [
