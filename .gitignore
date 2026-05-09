@@ -45,6 +45,7 @@ content.txt
 
 # Config with sensitive data
 config/accounts.json
+.env
 
 # Images
 images/publish_temp/*
