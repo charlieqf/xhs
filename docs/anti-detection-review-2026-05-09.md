@@ -72,23 +72,30 @@
   - **注**：上述阈值（3-5 条/天）为社区方向性共识，本项目未独立验证。下方 `day=5、week=25` 是据此定的起步值，不是通过实测得到。
 - **影响**：与问题 1 叠加，是当前架构下封号的两条最快路径。
 - **改进**：
-  - 第一阶段最小可用 schema，避免过度设计：
+  - 第一阶段最小可用 schema，避免过度设计（**每账号一文件**：`prod/account_state/<account_name>.json`）：
     ```json
     {
-      "<account_name>": {
-        "day_count": 0,
-        "day_started_at": "2026-05-09T00:00:00",
-        "day_limit": 5,
-        "last_action_at": null,
-        "min_action_interval_sec": 1800,
-        "frozen_until": null
-      }
+      "account_name": "<name>",
+      "day_count": 0,
+      "day_started_at": "2026-05-09",
+      "day_limit": 5,
+      "last_action_at": null,
+      "min_action_interval_sec": 1800,
+      "warning_count": 0,
+      "last_warning_at": null,
+      "frozen_until": null
     }
     ```
     每条评论发出前 check：`day_count < day_limit` 且 `now > frozen_until` 且 `now - last_action_at >= min_action_interval_sec`。三条全过才放行。
+  - **`warning_count` / `last_warning_at` 必须随 schema 一起进第一阶段**：第一阶段就要落地 4 档冻结阶梯（见下条），没有这两个字段无法判断当前应跳到哪一档；推迟会让阶梯改造无依托。
   - **`min_action_interval_sec` 不可省**：`day_limit=5` + `keyword_delay_min=30` + `post_delay_min=10` 跑下来，5 条评论会集中在 ~6 分钟窗口内完成，剩下 23h54m 静默——这种 burst 本身就是机器节律。强制 ≥30 分钟（甚至更长）的最小操作间隔，把 5 条打散到一天里。
-  - 第二阶段再补 `hour` / `week` 维度、`warning_count`、`last_warning_at`、软封计数。
-  - `bot_lite.py:213-230` 的两档检测接入 warning 累计阶梯：1 次 4-6h（接续现有 60-180s 短冷却之后转长冷却）→ 2 次 24h → 3 次 7d → 4 次永久退役；同时把这套逻辑泛化到 `comment_bot.py`。`error_code=300013` 偶发命中也可能是真人手快，不要一次就重判 24h。
+  - **实施约定（开发前必须确认的设计决策）**：
+    - **文件布局**：`prod/account_state/<account_name>.json`，每账号一文件。与 `prod/processed_cache.json` 同目录便于运维；每账号一文件让"按账号锁"自然成立，避免单 JSON 多账号读改写竞态。账号首次启动若文件不存在，按上述 schema 写入默认值（`day_count=0`、`day_limit=5`、`min_action_interval_sec=1800`、其他 null/0）。
+    - **时区**：`Asia/Shanghai`（XHS 风控按本地时间）。代码统一用 `datetime.now(ZoneInfo("Asia/Shanghai"))`，不要用 `datetime.now()` 默认本地时区——开发机时区不一定对得上。`day_started_at` 存日期字符串 `YYYY-MM-DD`（不带时分秒），便于直接 `==` 比较判跨日。
+    - **`day_count` 滚动语义——自然日 0:00（上海时间）重置**：每次读 state 时比较 `day_started_at` 是否等于今天，不等则把 `day_count` 重置为 0、`day_started_at` 更新为今天，再做 quota check。理由：实现简单（一次字符串比较），且配合 `min_action_interval_sec=1800` 后，"23:55 + 0:05 双发"边界绕过最多多 1-2 条，影响可控。**第二阶段升级 hour / week 维度时一并换为滑动窗口**。
+    - **并发锁**：复用 `scripts/run_lock.py` 的 `single_instance(lock_name)`，按账号粒度调用 `single_instance(f"xhs_account_{account_name}")`。同账号两 bot 互斥（避免双发），不同账号可并发（矩阵不串行化）。"每账号一文件 + 每账号一锁"组合下，`account_state/<name>.json` 的读改写**不再需要额外的文件级锁**。
+  - 第二阶段再补 `hour` / `week` 维度、滑动窗口实现、回查不可见次数等软封专用计数。
+  - `bot_lite.py:213-230` 的两档检测接入 warning 累计阶梯：1 次 4-6h（接续现有 60-180s 短冷却之后转长冷却）→ 2 次 24h → 3 次 7d → 4 次永久退役；同时把这套逻辑泛化到 `comment_bot.py` / `general_comment_bot.py`。命中即 `warning_count++`、按当前档位写 `frozen_until`、`last_warning_at` 记录命中时间。`error_code=300013` 偶发命中也可能是真人手快，不要一次就重判 24h。
   - **同步收紧 delay 下限**：把 `prod/config.json` 的 `keyword_delay_min` 从 3 拉到 ≥30，`post_delay_min` 从 2 拉到 ≥10，与养号节奏对齐。否则单加配额、不动 delay，跑出来的节奏依然是"激进 + 早停"，不是"舒缓"。
 
 ### 3. 软封反馈环不完整（P1）
@@ -169,7 +176,7 @@
 
 ### 第一阶段（1-2 天，立即做，封号风险下降一个数量级）
 
-- [ ] **#2** 引入 `account_state.json` 最小 schema：`day_count` + `day_limit` + `last_action_at` + `min_action_interval_sec` + `frozen_until`；起步 `day_limit=5`、`min_action_interval_sec=1800`（≥30 分钟，避免 5 条挤在 6 分钟窗口里）
+- [ ] **#2** 引入 `prod/account_state/<account_name>.json`（每账号一文件）最小 schema：`day_count` + `day_limit` + `day_started_at` + `last_action_at` + `min_action_interval_sec` + `warning_count` + `last_warning_at` + `frozen_until`；起步 `day_limit=5`、`min_action_interval_sec=1800`。所有时间字段用 `Asia/Shanghai`；`day_started_at` 存 `YYYY-MM-DD`，跨日按字符串比较重置 `day_count`。读改写并发由 `single_instance(f"xhs_account_{account_name}")` 保证（复用 `scripts/run_lock.py`）
 - [ ] **#2** 把 `prod/config.json` 的 `keyword_delay_min` 拉到 ≥30、`post_delay_min` 拉到 ≥10，与养号节奏对齐
 - [ ] **#2/#3** 把 `bot_lite.py:213-230` 的两档 URL 检测泛化到 `comment_bot.py` / `general_comment_bot.py`，并接入 warning 阶梯：1 次 4-6h、2 次 24h、3 次 7d、4 次永久退役
 - [ ] **#6** 砍掉 `prod/*.py` 入口的 `--headless` 参数，调用处写死 `headless=False`
@@ -187,8 +194,7 @@
 
 ### 第三阶段（按需，对抗协议/行为层检测）
 
-- [ ] **#2 续** 把 `account_state.json` 扩展为三层窗口（hour/day/week）+ `warning_count` + `last_warning_at`
-- [ ] **#4** 给 `Runtime.evaluate` 调用点加 try/catch wrapper，避免异常 stack 回流页面
+- [ ] **#2 续** 把 `account_state` 的 `day_count` 滚动窗口升级为滑动实现，并扩展 `hour` / `week` 维度（`warning_count` / `last_warning_at` 已在第一阶段落地）
 - [ ] **#4** 接入指纹自检页面（sannysoft / creep.js / antoinevastel.com）作为周期回归
 - [ ] **#5** `_click_element_by_cdp` 补 `mouseMoved` 前置 + press/release 80-300ms 间隔 + 坐标 ±N px 抖动
 - [ ] **#5** 延时分布换对数正态
