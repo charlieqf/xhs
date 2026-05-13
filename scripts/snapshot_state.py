@@ -107,6 +107,10 @@ def archive_account(account_name: str) -> dict:
 
 
 def main() -> int:
+    # Windows 默认 cp1252 stdout 会被中文 print 炸；切到 utf-8 才能在普通 powershell 跑
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if len(sys.argv) < 2:
         print("用法: python scripts/snapshot_state.py <account>", file=sys.stderr)
         return 1
