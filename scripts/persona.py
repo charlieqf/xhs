@@ -107,6 +107,11 @@ def build_voice_block(persona: dict[str, Any]) -> str:
         forbidden = "、".join(f"'{p}'" for p in persona["forbidden_phrases"])
         parts.append(f"严格不要出现以下词或近义表述：{forbidden}")
 
+    if persona.get("anti_examples"):
+        parts.append("以下是反面示例（**不要**写成这种风格）：")
+        for ex in persona["anti_examples"]:
+            parts.append(f"  ✗ {ex}")
+
     if persona.get("emoji_policy"):
         parts.append(f"Emoji 策略：{persona['emoji_policy']}")
 

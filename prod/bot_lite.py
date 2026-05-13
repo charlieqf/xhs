@@ -498,11 +498,17 @@ def _run_main(account: str, persona: dict):
                             time.sleep(1)
                             continue
 
-                        selected_idx = llm_result.get("selected_index", -1) - 1
+                        raw_selected = llm_result.get("selected_index", -1)
+                        selected_idx = raw_selected - 1
                         reason = llm_result.get("reason", "未提供")
-                        
+
                         if selected_idx < 0 or selected_idx >= len(comments_data):
-                            print(f"    -> [跳过] 无意向客户。({reason})")
+                            # 诊断：把 LLM 返回的原始 selected_index 与边界一起打印，
+                            # 判断是 LLM 真说了 -1，还是返回了 0 / 越界值导致误判
+                            print(
+                                f"    -> [跳过] 无意向客户。"
+                                f"(raw selected_index={raw_selected}, 候选数={len(comments_data)}; reason={reason})"
+                            )
                             cache[cache_key] = {"status": "no_intent"}
                             page.keyboard.press("Escape")
                             time.sleep(1)
