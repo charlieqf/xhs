@@ -149,6 +149,48 @@ def test_detect_risk_redirect_classifies_known_urls():
     assert risk_control.detect_risk_redirect("") is None
 
 
+def test_record_visibility_result_resets_on_visible():
+    acc = _fresh("vis_reset")
+    # 预置不可见计数
+    account_state.record_visibility_result(acc, False)
+    account_state.record_visibility_result(acc, False)
+    # 一次可见就清零
+    cons, total, warn = account_state.record_visibility_result(acc, True)
+    assert cons == 0
+    assert total == 2  # 累计计数不回退
+    assert warn is False
+
+
+def test_record_visibility_result_increments_on_invisible_and_warns_at_threshold():
+    acc = _fresh("vis_warn")
+    cons, total, warn = account_state.record_visibility_result(acc, False)
+    assert (cons, total, warn) == (1, 1, False)
+    cons, total, warn = account_state.record_visibility_result(acc, False)
+    assert (cons, total, warn) == (2, 2, False)
+    cons, total, warn = account_state.record_visibility_result(acc, False)
+    assert cons == 3 and total == 3 and warn is True, \
+        "consecutive count hitting 3 should signal should_warn"
+
+
+def test_visibility_fields_present_in_default_state():
+    acc = _fresh("vis_default")
+    s = account_state.load(acc)
+    assert s["consecutive_invisible_count"] == 0
+    assert s["total_invisible"] == 0
+
+
+def test_record_visibility_handles_legacy_state_without_field():
+    acc = _fresh("vis_legacy")
+    # 模拟旧 state 文件（没有 visibility 字段）
+    s = account_state.load(acc)
+    s.pop("consecutive_invisible_count", None)
+    s.pop("total_invisible", None)
+    account_state.save(acc, s)
+    # 第一次调用应当能正常补齐字段
+    cons, total, warn = account_state.record_visibility_result(acc, False)
+    assert cons == 1 and total == 1 and warn is False
+
+
 def test_check_and_record_writes_warning_to_state():
     acc = _fresh("rc_record")
     result = risk_control.check_and_record(acc, "https://x.com/explore")
@@ -181,6 +223,10 @@ TESTS = [
     test_warning_ladder_progression,
     test_detect_risk_redirect_classifies_known_urls,
     test_check_and_record_writes_warning_to_state,
+    test_record_visibility_result_resets_on_visible,
+    test_record_visibility_result_increments_on_invisible_and_warns_at_threshold,
+    test_visibility_fields_present_in_default_state,
+    test_record_visibility_handles_legacy_state_without_field,
 ]
 
 

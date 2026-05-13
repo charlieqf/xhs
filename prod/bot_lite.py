@@ -291,6 +291,65 @@ def _random_scroll(page):
     page.mouse.wheel(0, scroll_distance)
     time.sleep(random.uniform(0.5, 1.5))
 
+def _check_visibility_and_record(page, account: str, reply_content: str):
+    """评论发出后 30-60s 回查可见性；连续 3 次不可见走 warning 阶梯。
+
+    - 用回复文本前 15 字做 substring 匹配（LLM 生成回复唯一性高，前缀够区分）。
+    - DOM 读取失败 / 出现风控重定向时不计入两边——避免误伤。
+    - 命中阈值后调 ``account_state.record_warning``，按现有阶梯冻结
+      （1→4-6h、2→24h、3→7d、4→永久）。
+    """
+    wait_sec = random.uniform(30, 60)
+    print(f"    -> 🔍 等待 {wait_sec:.0f}s 后回查回复可见性...")
+    time.sleep(wait_sec)
+
+    # 出现风控重定向时不做回查（让外层 _check_rate_limit 处理）
+    if "error_code=300013" in page.url or "website-login/error" in page.url:
+        print(f"    -> 🔍 [跳过回查] 页面已被风控重定向")
+        return
+
+    prefix = (reply_content or "").strip()[:15]
+    if len(prefix) < 5:
+        print(f"    -> 🔍 [跳过回查] 回复文本过短，前缀匹配无意义")
+        return
+
+    visible: bool | None = None
+    try:
+        # 评论区 DOM 在浮层里；用 evaluate 拿所有可见 .comment-item 文本，
+        # 避免 Playwright 多次 locator 调用引入额外时序差异
+        page_text = page.evaluate(
+            """
+            () => {
+                const items = document.querySelectorAll('.comment-item');
+                return Array.from(items).map(el => el.innerText || '').join('\\n');
+            }
+            """
+        )
+        # DOM 完全为空 → 浮层被关掉或导航走了，不计入两边避免误伤
+        if not page_text or not page_text.strip():
+            print(f"    -> 🔍 [跳过回查] 评论区 DOM 为空（可能浮层已被导航关闭）")
+            return
+        visible = prefix in page_text
+    except Exception as e:
+        print(f"    -> 🔍 [回查异常] {e}；不计入可见/不可见统计")
+        return
+
+    cons, total, should_warn = account_state.record_visibility_result(account, visible)
+    if visible:
+        print(f"    -> 🔍 ✅ 回复可见（累计可见性: 已重置连续不可见计数）")
+        return
+
+    print(
+        f"    -> 🔍 ⚠️ 回复不可见（连续 {cons} 次 / 累计 {total} 次）"
+    )
+    if should_warn:
+        new_warning, frozen_until = account_state.record_warning(account)
+        print(
+            f"    -> 🔍 ⛔ 连续 {cons} 次不可见触发 warning 阶梯："
+            f"第 {new_warning} 次警告，冻结至 {frozen_until}"
+        )
+
+
 def _save_results(all_responses: list[dict], total_replies: int, round_number: int):
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     file_path = os.path.join(script_dir, f"bot_lite_responses_{timestamp}.json")
@@ -573,7 +632,12 @@ def _run_main(account: str, persona: dict):
                                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
                             })
                             cache[cache_key] = {"status": "replied", "user": target_comment["user"]}
-                            
+
+                            # 回查可见性（评审文档 P0-3 + Phase 2 任务 A）：
+                            # 在当前笔记浮层停留 30-60s 模拟自然浏览，再读评论区
+                            # 找回复前缀；连续 3 次找不到 → 走 warning 阶梯
+                            _check_visibility_and_record(page, account, reply_content)
+
                         except Exception as e:
                             print(f"    -> ❌ 模拟回复失败: {e}")
 

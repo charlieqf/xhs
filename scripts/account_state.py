@@ -95,6 +95,9 @@ def _default_state(account_name: str) -> dict[str, Any]:
         "warning_count": 0,
         "last_warning_at": None,
         "frozen_until": None,
+        # 可见性回查指标（评审文档 P0-3）
+        "consecutive_invisible_count": 0,
+        "total_invisible": 0,
     }
 
 
@@ -195,3 +198,42 @@ def record_warning(account_name: str) -> tuple[int, str]:
     state["frozen_until"] = _ladder_freeze_until(state["warning_count"])
     save(account_name, state)
     return state["warning_count"], state["frozen_until"]
+
+
+CONSECUTIVE_INVISIBLE_WARNING_THRESHOLD = 3
+
+
+def record_visibility_result(
+    account_name: str, visible: bool
+) -> tuple[int, int, bool]:
+    """Record one visibility re-check outcome.
+
+    - ``visible=True``: 清零 ``consecutive_invisible_count``。
+    - ``visible=False``: 自增 ``consecutive_invisible_count`` 与 ``total_invisible``。
+      累计阈值 (``CONSECUTIVE_INVISIBLE_WARNING_THRESHOLD``) 达成时，调用方
+      应当调用 ``record_warning`` 走阶梯（本函数不主动触发，避免双写 state）。
+
+    Returns ``(consecutive_invisible_count, total_invisible, should_warn)``。
+    ``should_warn`` 为 True 时调用方应进一步调用 ``record_warning``。
+    """
+    state = load(account_name)
+    # 旧 state 文件可能没有这两个字段，兼容
+    state.setdefault("consecutive_invisible_count", 0)
+    state.setdefault("total_invisible", 0)
+
+    if visible:
+        state["consecutive_invisible_count"] = 0
+    else:
+        state["consecutive_invisible_count"] += 1
+        state["total_invisible"] += 1
+
+    save(account_name, state)
+    should_warn = (
+        not visible
+        and state["consecutive_invisible_count"] >= CONSECUTIVE_INVISIBLE_WARNING_THRESHOLD
+    )
+    return (
+        state["consecutive_invisible_count"],
+        state["total_invisible"],
+        should_warn,
+    )
