@@ -337,17 +337,32 @@ def _check_visibility_and_record(page, account: str, reply_content: str):
     cons, total, should_warn = account_state.record_visibility_result(account, visible)
     if visible:
         print(f"    -> 🔍 ✅ 回复可见（累计可见性: 已重置连续不可见计数）")
-        return
-
-    print(
-        f"    -> 🔍 ⚠️ 回复不可见（连续 {cons} 次 / 累计 {total} 次）"
-    )
-    if should_warn:
-        new_warning, frozen_until = account_state.record_warning(account)
+    else:
         print(
-            f"    -> 🔍 ⛔ 连续 {cons} 次不可见触发 warning 阶梯："
-            f"第 {new_warning} 次警告，冻结至 {frozen_until}"
+            f"    -> 🔍 ⚠️ 回复不可见（连续 {cons} 次 / 累计 {total} 次）"
         )
+        if should_warn:
+            new_warning, frozen_until = account_state.record_warning(account)
+            print(
+                f"    -> 🔍 ⛔ 连续 {cons} 次不可见触发 warning 阶梯："
+                f"第 {new_warning} 次警告，冻结至 {frozen_until}"
+            )
+
+    # 仪表板告警：滑动窗 invisible 率 > 阈值时自动停 bot（7 天实验需要）
+    rate = account_state.recent_invisible_rate(account)
+    if rate is not None and rate > account_state.INVISIBLE_RATE_ALARM_THRESHOLD:
+        bar = "=" * 60
+        print(
+            f"\n{bar}\n"
+            f"⛔ ⛔ ⛔  invisible 率告警  ⛔ ⛔ ⛔\n"
+            f"最近 {account_state.INVISIBLE_RATE_WINDOW} 次回查中，invisible 率 ="
+            f" {rate:.0%}（阈值 {account_state.INVISIBLE_RATE_ALARM_THRESHOLD:.0%}）\n"
+            f"判定为软封前导信号——bot 自动停止，避免继续损耗账号。\n"
+            f"事后做尸检：拷贝 state 文件、当日 responses 文件、bot stdout，再决定是否继续。\n"
+            f"{bar}\n",
+            flush=True,
+        )
+        sys.exit(2)
 
 
 def _save_results(all_responses: list[dict], total_replies: int, round_number: int):

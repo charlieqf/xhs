@@ -63,3 +63,4 @@ prod/processed_cache_*.json
 prod/processed_cache_lite.json
 prod/profiles/* copy.json
 prod/account_state/
+prod/account_state_log/

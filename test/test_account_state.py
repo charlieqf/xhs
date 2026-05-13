@@ -185,10 +185,62 @@ def test_record_visibility_handles_legacy_state_without_field():
     s = account_state.load(acc)
     s.pop("consecutive_invisible_count", None)
     s.pop("total_invisible", None)
+    s.pop("visibility_window", None)
     account_state.save(acc, s)
     # 第一次调用应当能正常补齐字段
     cons, total, warn = account_state.record_visibility_result(acc, False)
     assert cons == 1 and total == 1 and warn is False
+    # 滑动窗也要补齐
+    s2 = account_state.load(acc)
+    assert s2["visibility_window"] == [False]
+
+
+def test_record_visibility_result_appends_to_window():
+    acc = _fresh("vis_window_append")
+    account_state.record_visibility_result(acc, True)
+    account_state.record_visibility_result(acc, False)
+    account_state.record_visibility_result(acc, True)
+    s = account_state.load(acc)
+    assert s["visibility_window"] == [True, False, True]
+
+
+def test_visibility_window_caps_at_max():
+    acc = _fresh("vis_window_cap")
+    # 推入超过 MAX 的样本，window 应被裁剪到 MAX
+    for _ in range(account_state.VISIBILITY_WINDOW_MAX + 5):
+        account_state.record_visibility_result(acc, True)
+    s = account_state.load(acc)
+    assert len(s["visibility_window"]) == account_state.VISIBILITY_WINDOW_MAX
+    assert all(s["visibility_window"])  # 全 True
+
+
+def test_recent_invisible_rate_returns_none_when_sample_too_small():
+    acc = _fresh("vis_rate_small")
+    # window 长度 < INVISIBLE_RATE_WINDOW
+    for _ in range(account_state.INVISIBLE_RATE_WINDOW - 1):
+        account_state.record_visibility_result(acc, False)
+    rate = account_state.recent_invisible_rate(acc)
+    assert rate is None, f"expected None for small sample, got {rate}"
+
+
+def test_recent_invisible_rate_correct_when_full_window():
+    acc = _fresh("vis_rate_full")
+    # 推 10 条：4 条 False、6 条 True → rate = 0.4
+    for v in [False, True, False, True, False, True, False, True, True, True]:
+        account_state.record_visibility_result(acc, v)
+    rate = account_state.recent_invisible_rate(acc)
+    assert rate == 0.4, f"expected 0.4, got {rate}"
+
+
+def test_recent_invisible_rate_uses_only_last_n():
+    acc = _fresh("vis_rate_window")
+    # 推 15 条：前 5 全 False（应被滑动窗排除），后 10 全 True → rate = 0
+    for _ in range(5):
+        account_state.record_visibility_result(acc, False)
+    for _ in range(10):
+        account_state.record_visibility_result(acc, True)
+    rate = account_state.recent_invisible_rate(acc)
+    assert rate == 0.0, f"expected 0.0 (last 10 all True), got {rate}"
 
 
 def test_check_and_record_writes_warning_to_state():
@@ -227,6 +279,11 @@ TESTS = [
     test_record_visibility_result_increments_on_invisible_and_warns_at_threshold,
     test_visibility_fields_present_in_default_state,
     test_record_visibility_handles_legacy_state_without_field,
+    test_record_visibility_result_appends_to_window,
+    test_visibility_window_caps_at_max,
+    test_recent_invisible_rate_returns_none_when_sample_too_small,
+    test_recent_invisible_rate_correct_when_full_window,
+    test_recent_invisible_rate_uses_only_last_n,
 ]
 
 

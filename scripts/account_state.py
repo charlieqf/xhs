@@ -98,6 +98,8 @@ def _default_state(account_name: str) -> dict[str, Any]:
         # 可见性回查指标（评审文档 P0-3）
         "consecutive_invisible_count": 0,
         "total_invisible": 0,
+        # 最近 N 次回查结果（True=可见, False=不可见），cap 至 VISIBILITY_WINDOW_MAX
+        "visibility_window": [],
     }
 
 
@@ -202,6 +204,11 @@ def record_warning(account_name: str) -> tuple[int, str]:
 
 CONSECUTIVE_INVISIBLE_WARNING_THRESHOLD = 3
 
+# 滑动窗 / invisible 率告警阈值（7 天急性边界实验仪表板）
+VISIBILITY_WINDOW_MAX = 20
+INVISIBLE_RATE_WINDOW = 10
+INVISIBLE_RATE_ALARM_THRESHOLD = 0.3
+
 
 def record_visibility_result(
     account_name: str, visible: bool
@@ -212,20 +219,27 @@ def record_visibility_result(
     - ``visible=False``: 自增 ``consecutive_invisible_count`` 与 ``total_invisible``。
       累计阈值 (``CONSECUTIVE_INVISIBLE_WARNING_THRESHOLD``) 达成时，调用方
       应当调用 ``record_warning`` 走阶梯（本函数不主动触发，避免双写 state）。
+    - 同时把 ``visible`` 追加到 ``visibility_window``（cap ``VISIBILITY_WINDOW_MAX``）。
+      调用方可用 ``recent_invisible_rate`` 算最近 N 次的不可见率告警。
 
     Returns ``(consecutive_invisible_count, total_invisible, should_warn)``。
-    ``should_warn`` 为 True 时调用方应进一步调用 ``record_warning``。
     """
     state = load(account_name)
-    # 旧 state 文件可能没有这两个字段，兼容
+    # 旧 state 文件可能没有这几个字段，兼容
     state.setdefault("consecutive_invisible_count", 0)
     state.setdefault("total_invisible", 0)
+    state.setdefault("visibility_window", [])
 
     if visible:
         state["consecutive_invisible_count"] = 0
     else:
         state["consecutive_invisible_count"] += 1
         state["total_invisible"] += 1
+
+    # append + cap 滑动窗
+    state["visibility_window"].append(bool(visible))
+    if len(state["visibility_window"]) > VISIBILITY_WINDOW_MAX:
+        state["visibility_window"] = state["visibility_window"][-VISIBILITY_WINDOW_MAX:]
 
     save(account_name, state)
     should_warn = (
@@ -237,3 +251,20 @@ def record_visibility_result(
         state["total_invisible"],
         should_warn,
     )
+
+
+def recent_invisible_rate(
+    account_name: str, window_size: int = INVISIBLE_RATE_WINDOW
+) -> float | None:
+    """计算最近 ``window_size`` 次回查的 invisible 率。
+
+    样本不足（visibility_window 长度 < window_size）时返回 ``None``——避免在
+    实验初期数据量小时触发误报警。
+    """
+    state = load(account_name)
+    window = state.get("visibility_window", [])
+    if len(window) < window_size:
+        return None
+    recent = window[-window_size:]
+    invisible_count = sum(1 for v in recent if not v)
+    return invisible_count / window_size
