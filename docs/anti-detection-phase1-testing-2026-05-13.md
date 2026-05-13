@@ -33,9 +33,9 @@
 | Layer 3 — `single_instance` 锁 | ✅ 隐式 | 多次启动 bot 无冲突，bot 正常退出锁正常释放 |
 | Layer 3 — `record_send` 不误触 | ✅ | 跑完 state 文件 `day_count=0`、`last_action_at=null` |
 | Layer 3 — `record_warning` 不误触 | ✅ | 跑完 `warning_count=0` |
-| Layer 4 — `record_send` 真触发 | （跑完更新） | day_count 应递增到 2 |
-| Layer 4 — `min_interval` 真拦截 | （跑完更新） | 临时设 180s，应在第 2 次发送前看到 `min_interval_not_met` |
-| Layer 4 — `daily_quota` 真拦截 | （跑完更新） | 临时设 day_limit=2，达标后应看到 `daily_quota_exceeded (2/2)` |
+| Layer 4 — `record_send` 真触发 | ✅ | bot 输出 2 次 `-> ✅ 回复操作已模拟完成！`；state 文件 `day_count=2`、`last_action_at=2026-05-13T12:09:51+08:00` |
+| Layer 4 — `min_interval` 真拦截 | ✅ | 临时设 180s；第 1 次发送后下一个候选打印 `min_interval_not_met (126s remaining)`，再下一个 `(81s remaining)`，倒计时正确递减；超过 180s 后第 2 次发送顺利放行 |
+| Layer 4 — `daily_quota` 真拦截 | ✅ | 临时设 day_limit=2；第 2 次发送后连续 7 个候选全部命中 `daily_quota_exceeded (2/2)`，无一漏网 |
 
 ## 测试期间暴露的 4 个文档外问题
 
@@ -97,9 +97,14 @@
 4. **state 文件是验证 bot 行为的最强证据**——`day_count` / `last_action_at` / `warning_count` 比 stdout log 可信得多。每次跑完 bot 都看一眼 state 文件，就知道它真的做了什么。
 5. **不要轻易消耗测试账号额度**——Layer 4 用临时调紧参数（day_limit=2 / min_interval=180）能在 5-10 分钟内验证完，不必跑完一整天的 5 条 quota。验证完一定要把参数恢复到生产值。
 
+## Layer 4 收尾的两条操作要点
+
+- **state 不要全量重置**：跑完后保留 `day_count` 和 `last_action_at`（真实活动），只把 `day_limit` / `min_action_interval_sec` 改回生产值（5 / 1800）。如果连同 `day_count` 一起清成 0，bot 当天可能再发 5 条，加上测试发的 2 条 = 7 条，**超出 5 条/日的养号节奏**。`day_count` 第二天 0:00 Asia/Shanghai 会自动滚回。
+- **Layer 4 副作用记录**：测试账号当日发出的 2 条评论是真实的、留在评论区，话术属于尚未在 Phase 2 优化的同质化版本。如果担心这两条成为风控侧的"机器味基线"，可以手动到笔记下删除（不影响 `day_count`，`day_count` 是本地计数，不会因评论被删而回退）。
+
 ## 后续
 
-- [ ] Layer 4 跑完更新本文上面的表格
+- [x] Layer 4 跑完更新本文上面的表格
 - [ ] 决定 Phase 2 是否提前启动（基于问题 D 的实证）
 - [ ] 修问题 B（双子域登录），矩阵扩账号前必须做
 - [ ] 加 LLM 故障的明确诊断输出（问题 A 的教训）
