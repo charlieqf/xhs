@@ -41,6 +41,7 @@ from cdp_publish import XiaohongshuPublisher
 # 反检测模块（账号配额 + 风控信号）
 import account_state
 import risk_control
+import persona as persona_mod
 from account_manager import get_default_account
 from run_lock import single_instance, SingleInstanceError
 
@@ -266,87 +267,52 @@ def get_next_keyword_batch(
 #  LLM 评论分析
 # ============================================================
 
-SERVICE_DESC = (
-    "为单身人群提供真诚靠谱的脱单交友服务，"
-    "精准匹配同频对象，拓展社交圈，"
-    "告别无效相亲与低效尬聊。"
-)
-
-
-def evaluate_comments_with_llm(
-    comments: list[dict],
-) -> dict | None:
-    """
-    将评论发送给 LLM 分析，判断哪条最有相亲意向。
-    无意向时返回 selected_index = -1。
-    """
-    if not OPENROUTER_API_KEY:
-        print("  -> [警告] 未设置 OPENROUTER_API_KEY / api_key，跳过 LLM 分析。")
-        return None
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # 构建评论文本
+def _build_eval_user_prompt(comments: list[dict], voice_block: str, regen_hint: str = "") -> str:
     comments_text = ""
     for i, c in enumerate(comments):
         user = c.get("userInfo", {}).get("nickname", "Unknown")
         content = c.get("content", "").replace("\n", " ")
         comments_text += f"[{i + 1}] 用户: {user}, 评论: {content}\n"
 
-    prompt = f"""
-请分析以下来自小红书帖子的评论。
-你的任务是：
-1. 判断哪一条评论的用户表现出了最强烈的相亲/交友/脱单意向（有找对象的潜在需求）。
-2. 如果没有任何评论有相亲/交友意向，请返回 selected_index 为 -1。
-3. 如果有意向，针对最有意向的评论生成一条回复。
-4. 回复核心目的：自然地邀请对方发私信了解我们的服务。
-5. 服务介绍（可适当缩写）：「{SERVICE_DESC}」
-6. 回复要求：
-   - 像真实小红书用户，友好、真诚、有网感
-   - 字数严格控制在50字以内
-   - 不要使用 emoji 表情
+    head = (
+        "任务：分析以下小红书评论。\n"
+        "1) 判断哪一条评论的用户表现出最强的相亲/交友/脱单意向；无意向时 selected_index 设为 -1。\n"
+        "2) 有意向时，针对最强意向那条生成 50 字以内的自然回复。\n\n"
+        f"{voice_block}\n"
+    )
+    if regen_hint:
+        head += f"\n额外注意：{regen_hint}\n"
 
-评论列表：
-{comments_text}
+    return (
+        f"{head}\n评论列表：\n{comments_text}\n"
+        "请严格按照以下 JSON 格式返回（不要返回 JSON 以外的任何内容）：\n"
+        f'{{"selected_index": <整数 1-{len(comments)} 或 -1>, '
+        '"reason": "...", "generated_reply": "..."}'
+    )
 
-请严格按照以下JSON格式返回（不要返回除JSON以外的任何内容）：
-{{
-  "selected_index": 整数, 选中的评论编号(1-{len(comments)})，无意向时为 -1,
-  "reason": "选择或跳过的理由",
-  "generated_reply": "回复文本（无意向时为空字符串）"
-}}
-"""
 
+def _call_llm_once(system_msg: str, user_prompt: str, model: str) -> dict | None:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": model,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a highly emotionally intelligent matchmaking "
-                    "service assistant. You analyze comments and generate "
-                    "natural, concise Chinese replies."
-                ),
-            },
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt},
         ],
     }
-
+    content_text = ""
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         content_text = data["choices"][0]["message"]["content"]
-
-        # 尝试提取 JSON
         match = re.search(r"\{.*\}", content_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-
         return json.loads(content_text)
     except json.JSONDecodeError:
         print(f"  -> [错误] LLM 返回非 JSON: {content_text[:200]}")
@@ -356,6 +322,53 @@ def evaluate_comments_with_llm(
         if "resp" in locals() and hasattr(resp, "text"):
             print(f"  -> [响应]: {resp.text[:300]}")
         return None
+
+
+def evaluate_comments_with_llm(
+    comments: list[dict],
+    persona: dict,
+) -> dict | None:
+    """LLM 评论意向判定 + 回复生成；按 persona 注入身份/语气/禁用词。
+
+    无意向时返回 ``selected_index = -1``；有意向但 LLM 生成回复命中禁用词且
+    regenerate 后仍命中，返回 None（caller 当作"无可用回复"处理）。
+    """
+    if not OPENROUTER_API_KEY:
+        print("  -> [警告] 未设置 OPENROUTER_API_KEY / api_key，跳过 LLM 分析。")
+        return None
+
+    system_msg = persona_mod.build_system_message(persona)
+    voice_block = persona_mod.build_voice_block(persona)
+    model = persona_mod.llm_model(persona)
+
+    user_prompt = _build_eval_user_prompt(comments, voice_block)
+    result = _call_llm_once(system_msg, user_prompt, model)
+    if not result:
+        return None
+
+    reply = result.get("generated_reply", "") or ""
+    hits = persona_mod.find_forbidden(reply, persona)
+    if not hits:
+        return result
+
+    if persona.get("on_forbidden_match") != "regenerate_once":
+        print(f"  -> [drop] 回复含禁用词 {hits}（policy=skip）")
+        return None
+
+    regen_hint = (
+        f"上一次回复包含禁用词 {hits}，请彻底换一种表达，"
+        "绝对不要再使用任何同义或近似表达。"
+    )
+    user_prompt2 = _build_eval_user_prompt(comments, voice_block, regen_hint=regen_hint)
+    second = _call_llm_once(system_msg, user_prompt2, model)
+    if not second:
+        return None
+    hits2 = persona_mod.find_forbidden(second.get("generated_reply", "") or "", persona)
+    if hits2:
+        print(f"  -> [drop] regenerate 后仍含禁用词 {hits2}")
+        return None
+    print(f"  -> [regenerated] 因含 {hits}，已重生成")
+    return second
 
 
 # ============================================================
@@ -790,12 +803,23 @@ def main():
         help="账号名（对应 prod/account_state/<name>.json + Chrome profile）；"
         "省略则用 account_manager 的默认账号",
     )
+    parser.add_argument(
+        "--persona",
+        default=persona_mod.DEFAULT_PERSONA,
+        help=f"persona 名（对应 prod/personas/<name>.json）；默认 {persona_mod.DEFAULT_PERSONA}",
+    )
     args = parser.parse_args()
     account = args.account or get_default_account()
+    try:
+        persona = persona_mod.load(args.persona)
+    except persona_mod.PersonaError as e:
+        print(f"⛔ persona 加载失败：{e}")
+        sys.exit(1)
 
     print("=" * 60)
     print("  小红书评论自动回复机器人 (生产版 · 无限模式)")
     print(f"  账号: {account}")
+    print(f"  Persona: {persona['name']} — {persona.get('description', '')}")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
 
@@ -994,7 +1018,7 @@ def main():
                         )
 
                         # 4. LLM 分析
-                        llm_result = evaluate_comments_with_llm(comments_to_analyze)
+                        llm_result = evaluate_comments_with_llm(comments_to_analyze, persona)
 
                         if not llm_result:
                             print("    -> [跳过] LLM 分析失败。")

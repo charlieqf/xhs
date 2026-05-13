@@ -34,9 +34,10 @@ if os.path.exists(env_path):
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("api_key", "")
 
-# 反检测模块（账号配额 + 风控信号）
+# 反检测模块（账号配额 + 风控信号 + persona 去同质化）
 import account_state
 import risk_control
+import persona as persona_mod
 from account_manager import get_default_account
 from run_lock import single_instance, SingleInstanceError
 
@@ -171,38 +172,37 @@ def get_next_keyword_batch(config: dict, keywords_data: dict, round_number: int)
 #  LLM 评论分析
 # ============================================================
 
-SERVICE_DESC = "为单身人群提供真诚靠谱的脱单交友服务，精准匹配同频对象，拓展社交圈，告别无效相亲与低效尬聊。"
-
-def evaluate_comments_with_llm(comments: list[dict]) -> dict | None:
-    if not OPENROUTER_API_KEY:
-        return None
-
+def _build_eval_user_prompt(comments: list[dict], voice_block: str, regen_hint: str = "") -> str:
     comments_text = ""
     for i, c in enumerate(comments):
         comments_text += f"[{i + 1}] 用户: {c['user']}, 评论: {c['content']}\n"
 
-    prompt = f"""
-你的任务是判断下方哪条小红书评论展现了最强的脱单/相亲意向。
-没有意向时返回 selected_index: -1。
-有意向时生成50字内的自然回复（像真实用户，引导私信，不使用emoji）。
-服务："{SERVICE_DESC}"
+    head = (
+        "任务：判断下方哪条小红书评论展现了最强的脱单/相亲意向。\n"
+        "没有意向时返回 selected_index: -1。有意向时生成 50 字内的自然回复。\n\n"
+        f"{voice_block}\n"
+    )
+    if regen_hint:
+        head += f"\n额外注意：{regen_hint}\n"
 
-评论：
-{comments_text}
+    return (
+        f"{head}\n"
+        f"评论：\n{comments_text}\n"
+        "严格返回 JSON，例如："
+        '{"selected_index": 1, "reason": "...", "generated_reply": "..."}'
+    )
 
-严格返回JSON，例如：{{"selected_index": 1, "reason": "...", "generated_reply": "..."}}
-"""
 
+def _call_llm_once(system_msg: str, user_prompt: str, model: str) -> dict | None:
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": model,
         "messages": [
-            {"role": "system", "content": "You are a customer service bot. Output only JSON."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt},
         ],
     }
-
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         content_text = resp.json()["choices"][0]["message"]["content"]
@@ -211,6 +211,45 @@ def evaluate_comments_with_llm(comments: list[dict]) -> dict | None:
     except Exception as e:
         print(f"  -> [错误] 调用 LLM 失败: {e}")
         return None
+
+
+def evaluate_comments_with_llm(comments: list[dict], persona: dict) -> dict | None:
+    if not OPENROUTER_API_KEY:
+        return None
+
+    system_msg = persona_mod.build_system_message(persona)
+    voice_block = persona_mod.build_voice_block(persona)
+    model = persona_mod.llm_model(persona)
+
+    user_prompt = _build_eval_user_prompt(comments, voice_block)
+    result = _call_llm_once(system_msg, user_prompt, model)
+    if not result:
+        return None
+
+    reply = result.get("generated_reply", "") or ""
+    hits = persona_mod.find_forbidden(reply, persona)
+    if not hits:
+        return result
+
+    # 命中禁用词 → 按 on_forbidden_match 策略处理
+    if persona.get("on_forbidden_match") != "regenerate_once":
+        print(f"  -> [drop] 回复含禁用词 {hits}（policy=skip）")
+        return None
+
+    regen_hint = (
+        f"上一次回复包含禁用词 {hits}，请彻底换一种表达，"
+        "绝对不要再使用任何同义或近似表达。"
+    )
+    user_prompt2 = _build_eval_user_prompt(comments, voice_block, regen_hint=regen_hint)
+    second = _call_llm_once(system_msg, user_prompt2, model)
+    if not second:
+        return None
+    hits2 = persona_mod.find_forbidden(second.get("generated_reply", "") or "", persona)
+    if hits2:
+        print(f"  -> [drop] regenerate 后仍含禁用词 {hits2}")
+        return None
+    print(f"  -> [regenerated] 因含 {hits}，已重生成")
+    return second
 
 
 # ============================================================
@@ -269,12 +308,23 @@ def main():
         help="账号名（对应 prod/account_state/<name>.json + Chrome profile）；"
         "省略则用 account_manager 的默认账号",
     )
+    parser.add_argument(
+        "--persona",
+        default=persona_mod.DEFAULT_PERSONA,
+        help=f"persona 名（对应 prod/personas/<name>.json）；默认 {persona_mod.DEFAULT_PERSONA}",
+    )
     args = parser.parse_args()
     account = args.account or get_default_account()
+    try:
+        persona = persona_mod.load(args.persona)
+    except persona_mod.PersonaError as e:
+        print(f"⛔ persona 加载失败：{e}")
+        sys.exit(1)
 
     print("=" * 60)
     print("  小红书评论自动回复机器人 (Lite Playwright 版)")
     print(f"  账号: {account}")
+    print(f"  Persona: {persona['name']} — {persona.get('description', '')}")
     print("  按 Ctrl+C 可随时安全停止")
     print("=" * 60)
 
@@ -289,13 +339,13 @@ def main():
 
     try:
         with single_instance(f"xhs_account_{account}"):
-            _run_main(account)
+            _run_main(account, persona)
     except SingleInstanceError as e:
         print(f"⛔ {e}")
         sys.exit(1)
 
 
-def _run_main(account: str):
+def _run_main(account: str, persona: dict):
     config = load_config()
     keywords_data = load_keywords()
     cache = load_cache()
@@ -442,7 +492,7 @@ def _run_main(account: str):
 
                         # 让 LLM 分析
                         print(f"    -> 分析 {len(comments_data)} 条评论...")
-                        llm_result = evaluate_comments_with_llm(comments_data)
+                        llm_result = evaluate_comments_with_llm(comments_data, persona)
                         if not llm_result:
                             page.keyboard.press("Escape")
                             time.sleep(1)

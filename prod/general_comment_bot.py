@@ -47,6 +47,7 @@ from cdp_publish import XiaohongshuPublisher
 # 反检测模块（账号配额 + 风控信号）
 import account_state
 import risk_control
+import persona as persona_mod
 from account_manager import get_default_account
 from run_lock import single_instance, SingleInstanceError
 
@@ -314,41 +315,13 @@ def get_next_keyword_batch(profile: dict, round_number: int) -> tuple[list[str],
 #  LLM 评论分析
 # ============================================================
 
-def evaluate_comments_with_llm(
-    profile: dict,
+def _build_eval_user_prompt(
     comments: list[dict],
-) -> dict | None:
-    """
-    将评论发送给 LLM 分析，判断哪条最有业务意向。
-    无意向时返回 selected_index = -1。
-    """
-    if not OPENROUTER_API_KEY:
-        print("  -> [警告] 未设置 OPENROUTER_API_KEY / api_key，跳过 LLM 分析。")
-        return None
-
-    service_desc = profile.get("service_desc", "")
-    intent_terms = profile.get("llm_intent_terms", "相关服务")
-    reply_style = profile.get(
-        "llm_reply_style",
-        "像真实小红书用户，友好、真诚、有网感",
-    )
-    reply_max_chars = profile.get("llm_reply_max_chars", 50)
-    system_prompt = render_prompt(
-        get_prompt(profile, "comment_system"),
-        {
-            "service_desc": service_desc,
-            "intent_terms": intent_terms,
-            "reply_style": reply_style,
-            "reply_max_chars": reply_max_chars,
-        },
-    )
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    voice_block: str,
+    intent_terms: str,
+    reply_max_chars: int,
+    regen_hint: str = "",
+) -> str:
     comments_text = ""
     for i, c in enumerate(comments):
         user = c.get("userInfo", {}).get("nickname", "Unknown")
@@ -358,37 +331,45 @@ def evaluate_comments_with_llm(
             f"[{i + 1}] 用户: {user}, 省份: {province}, 评论: {content}\n"
         )
 
-    prompt = render_prompt(
-        get_prompt(profile, "comment_user"),
-        {
-            "service_desc": service_desc,
-            "intent_terms": intent_terms,
-            "reply_style": reply_style,
-            "reply_max_chars": reply_max_chars,
-            "comments_text": comments_text,
-            "comments_count": len(comments),
-        },
+    head = (
+        f"任务：分析以下小红书评论。\n"
+        f"1) 判断哪一条评论的用户表现出最强的 {intent_terms} 意向；无意向时 selected_index 设为 -1。\n"
+        f"2) 有意向时，针对最强意向那条生成 {reply_max_chars} 字以内的自然回复。\n\n"
+        f"{voice_block}\n"
+    )
+    if regen_hint:
+        head += f"\n额外注意：{regen_hint}\n"
+
+    return (
+        f"{head}\n评论列表：\n{comments_text}\n"
+        "请严格按照以下 JSON 格式返回（不要返回 JSON 以外的任何内容）：\n"
+        f'{{"selected_index": <整数 1-{len(comments)} 或 -1>, '
+        '"reason": "...", "generated_reply": "..."}'
     )
 
+
+def _call_llm_once(system_msg: str, user_prompt: str, model: str) -> dict | None:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "model": profile.get("llm_model", "google/gemini-3-flash-preview"),
+        "model": model,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt},
         ],
     }
-
     content_text = ""
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         content_text = data["choices"][0]["message"]["content"]
-
         match = re.search(r"\{.*\}", content_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-
         return json.loads(content_text)
     except json.JSONDecodeError:
         print(f"  -> [错误] LLM 返回非 JSON: {content_text[:200]}")
@@ -398,6 +379,63 @@ def evaluate_comments_with_llm(
         if "resp" in locals() and hasattr(resp, "text"):
             print(f"  -> [响应]: {resp.text[:300]}")
         return None
+
+
+def evaluate_comments_with_llm(
+    profile: dict,
+    persona: dict,
+    comments: list[dict],
+) -> dict | None:
+    """LLM 评论意向判定 + 回复生成。
+
+    profile 提供业务侧字段（intent_terms / reply_max_chars / 默认 model）；
+    persona 提供身份/语气/禁用词；persona.llm.model 若设置则覆盖 profile.llm_model。
+    """
+    if not OPENROUTER_API_KEY:
+        print("  -> [警告] 未设置 OPENROUTER_API_KEY / api_key，跳过 LLM 分析。")
+        return None
+
+    intent_terms = profile.get("llm_intent_terms", "相关业务")
+    reply_max_chars = profile.get("llm_reply_max_chars", 50)
+
+    system_msg = persona_mod.build_system_message(persona)
+    voice_block = persona_mod.build_voice_block(persona)
+    model = (
+        persona.get("llm", {}).get("model")
+        or profile.get("llm_model")
+        or "google/gemini-3-flash-preview"
+    )
+
+    user_prompt = _build_eval_user_prompt(comments, voice_block, intent_terms, reply_max_chars)
+    result = _call_llm_once(system_msg, user_prompt, model)
+    if not result:
+        return None
+
+    reply = result.get("generated_reply", "") or ""
+    hits = persona_mod.find_forbidden(reply, persona)
+    if not hits:
+        return result
+
+    if persona.get("on_forbidden_match") != "regenerate_once":
+        print(f"  -> [drop] 回复含禁用词 {hits}（policy=skip）")
+        return None
+
+    regen_hint = (
+        f"上一次回复包含禁用词 {hits}，请彻底换一种表达，"
+        "绝对不要再使用任何同义或近似表达。"
+    )
+    user_prompt2 = _build_eval_user_prompt(
+        comments, voice_block, intent_terms, reply_max_chars, regen_hint=regen_hint
+    )
+    second = _call_llm_once(system_msg, user_prompt2, model)
+    if not second:
+        return None
+    hits2 = persona_mod.find_forbidden(second.get("generated_reply", "") or "", persona)
+    if hits2:
+        print(f"  -> [drop] regenerate 后仍含禁用词 {hits2}")
+        return None
+    print(f"  -> [regenerated] 因含 {hits}，已重生成")
+    return second
 
 
 # ============================================================
@@ -1678,9 +1716,19 @@ def main():
         help="账号名（对应 prod/account_state/<name>.json + Chrome profile）；"
         "省略则用 account_manager 的默认账号",
     )
+    parser.add_argument(
+        "--persona",
+        default=persona_mod.DEFAULT_PERSONA,
+        help=f"persona 名（对应 prod/personas/<name>.json）；默认 {persona_mod.DEFAULT_PERSONA}",
+    )
     args = parser.parse_args()
     profile_name = args.profile
     account = args.account or get_default_account()
+    try:
+        persona = persona_mod.load(args.persona)
+    except persona_mod.PersonaError as e:
+        print(f"⛔ persona 加载失败：{e}")
+        sys.exit(1)
 
     # --- 加载 profile ---
     try:
@@ -1696,6 +1744,7 @@ def main():
     print(f"  小红书评论自动回复机器人 (通用版 · 无限模式)")
     print(f"  当前业务: {service_name} [profile={profile_name}]")
     print(f"  账号: {account}")
+    print(f"  Persona: {persona['name']} — {persona.get('description', '')}")
     if target_provinces:
         print(f"  目标省份: {', '.join(target_provinces)}")
     print("  按 Ctrl+C 可随时安全停止")
@@ -1958,7 +2007,7 @@ def main():
                             f"取前 {len(comments_to_analyze)} 条送 LLM 分析..."
                         )
 
-                        llm_result = evaluate_comments_with_llm(profile, comments_to_analyze)
+                        llm_result = evaluate_comments_with_llm(profile, persona, comments_to_analyze)
 
                         if not llm_result:
                             print("    -> [跳过] LLM 分析失败。")
