@@ -99,9 +99,13 @@ def build_voice_block(persona: dict[str, Any]) -> str:
     for v in persona["voice_constraints"]:
         parts.append(f"  - {v}")
 
-    if persona.get("preferred_register_hints"):
-        hints = "、".join(persona["preferred_register_hints"])
-        parts.append(f"可以适度使用的表达：{hints}")
+    # 注：故意不再把 preferred_register_hints 直接喂给 LLM——D3 实测显示这会
+    # 让 LLM 把列表里的几个短语当模板池反复套用（"想细说接着聊" 占 17/20=85%）。
+    # 偏好词只用于人工审 persona 设计意图，不进 prompt。
+
+    parts.append("回复多样性：避免在连续回复里使用相同的开头词（如'我自己/说实话/真心说'）"
+                 "或相同的结尾句式（如'..接着聊/..可以聊'），不要每条都自报背景。"
+                 "针对评论里出现的具体词或事实做反应，不要套通用共情框架。")
 
     if persona["forbidden_phrases"]:
         forbidden = "、".join(f"'{p}'" for p in persona["forbidden_phrases"])
@@ -111,6 +115,11 @@ def build_voice_block(persona: dict[str, Any]) -> str:
         parts.append("以下是反面示例（**不要**写成这种风格）：")
         for ex in persona["anti_examples"]:
             parts.append(f"  ✗ {ex}")
+
+    if persona.get("good_examples"):
+        parts.append("以下是高质量回复示例——学习这种针对原文具体细节的回应方式，注意每条都直接给观点/共情/建议，不开后续接触口子：")
+        for ex in persona["good_examples"]:
+            parts.append(f"  ✓ {ex}")
 
     if persona.get("emoji_policy"):
         parts.append(f"Emoji 策略：{persona['emoji_policy']}")

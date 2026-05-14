@@ -5,9 +5,11 @@
     "sports_count": 1,
     "min_comment_count": 5,
     "analyze_comment_count": 10,
-    "post_per_keyword": 1,
+    "post_per_keyword": 2,
     "keyword_delay_min": 30,
     "keyword_delay_max": 60,
     "post_delay_min": 10,
-    "post_delay_max": 25
+    "post_delay_max": 25,
+    "active_windows": [["08:00", "10:30"], ["14:00", "16:30"], ["20:00", "22:30"]],
+    "active_windows_enabled": true
 }

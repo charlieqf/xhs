@@ -172,14 +172,28 @@ def get_next_keyword_batch(config: dict, keywords_data: dict, round_number: int)
 #  LLM 评论分析
 # ============================================================
 
-def _build_eval_user_prompt(comments: list[dict], voice_block: str, regen_hint: str = "") -> str:
+def _build_eval_user_prompt(
+    comments: list[dict],
+    voice_block: str,
+    note_title: str = "",
+    regen_hint: str = "",
+) -> str:
     comments_text = ""
     for i, c in enumerate(comments):
         comments_text += f"[{i + 1}] 用户: {c['user']}, 评论: {c['content']}\n"
 
+    note_block = f"这条评论所在笔记标题：{note_title!r}\n\n" if note_title else ""
+
     head = (
         "任务：判断下方哪条小红书评论展现了最强的脱单/相亲意向。\n"
-        "没有意向时返回 selected_index: -1。有意向时生成 50 字内的自然回复。\n\n"
+        "没有意向时返回 selected_index: -1。有意向时生成 50 字内的自然回复。\n"
+        "意向判定要适度——只要评论流露出对相亲/脱单/情感的真实关注（包括"
+        "求助/吐槽/感慨/分享相似经历/隐含困惑等），就算有意向。**不要因为"
+        "评论太短或没有'具体词'就轻易判 -1**。\n"
+        "回复优先抓评论里的具体词或事实做反应；如果评论太短没有具体细节，"
+        "但你能感受到对方真实的情绪/困惑/共鸣点，也可以基于这种共鸣给观点"
+        "（但不要凭空臆造对方的身份、年龄、性别或条件）。\n\n"
+        f"{note_block}"
         f"{voice_block}\n"
     )
     if regen_hint:
@@ -188,8 +202,16 @@ def _build_eval_user_prompt(comments: list[dict], voice_block: str, regen_hint: 
     return (
         f"{head}\n"
         f"评论：\n{comments_text}\n"
-        "严格返回 JSON，例如："
-        '{"selected_index": 1, "reason": "...", "generated_reply": "..."}'
+        "严格返回 JSON，schema 如下（specific_detail_picked 和 reaction_to_detail 是中间思考字段，"
+        "目的是让你先理解评论再回复，避免直接套通用框架；评论太短无具体词时填情绪基调或共鸣点也可，"
+        "但有意向时不能整段留空跳过思考）：\n"
+        '{\n'
+        '  "selected_index": 1 或 -1,\n'
+        '  "reason": "为什么选/不选这条评论",\n'
+        '  "specific_detail_picked": "评论里最具体的词、事实、情绪或共鸣点（评论极短时填情绪基调即可；无意向时填空字符串）",\n'
+        '  "reaction_to_detail": "你对这个具体点或情绪的真实想法（不是套话；无意向时填空字符串）",\n'
+        '  "generated_reply": "基于上面两步生成的 50 字内回复（无意向时填空字符串）"\n'
+        '}'
     )
 
 
@@ -202,6 +224,10 @@ def _call_llm_once(system_msg: str, user_prompt: str, model: str) -> dict | None
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_prompt},
         ],
+        # 0.85 鼓励多样化措辞，避免 D3 那种"想细说接着聊" 17/20 占比
+        "temperature": 0.85,
+        # 强制结构化 JSON 输出（OpenRouter 对支持的模型转发；不支持时无副作用）
+        "response_format": {"type": "json_object"},
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -213,7 +239,9 @@ def _call_llm_once(system_msg: str, user_prompt: str, model: str) -> dict | None
         return None
 
 
-def evaluate_comments_with_llm(comments: list[dict], persona: dict) -> dict | None:
+def evaluate_comments_with_llm(
+    comments: list[dict], persona: dict, note_title: str = ""
+) -> dict | None:
     if not OPENROUTER_API_KEY:
         return None
 
@@ -221,7 +249,7 @@ def evaluate_comments_with_llm(comments: list[dict], persona: dict) -> dict | No
     voice_block = persona_mod.build_voice_block(persona)
     model = persona_mod.llm_model(persona)
 
-    user_prompt = _build_eval_user_prompt(comments, voice_block)
+    user_prompt = _build_eval_user_prompt(comments, voice_block, note_title=note_title)
     result = _call_llm_once(system_msg, user_prompt, model)
     if not result:
         return None
@@ -240,7 +268,9 @@ def evaluate_comments_with_llm(comments: list[dict], persona: dict) -> dict | No
         f"上一次回复包含禁用词 {hits}，请彻底换一种表达，"
         "绝对不要再使用任何同义或近似表达。"
     )
-    user_prompt2 = _build_eval_user_prompt(comments, voice_block, regen_hint=regen_hint)
+    user_prompt2 = _build_eval_user_prompt(
+        comments, voice_block, note_title=note_title, regen_hint=regen_hint
+    )
     second = _call_llm_once(system_msg, user_prompt2, model)
     if not second:
         return None
@@ -255,6 +285,67 @@ def evaluate_comments_with_llm(comments: list[dict], persona: dict) -> dict | No
 # ============================================================
 #  主逻辑
 # ============================================================
+
+def _hhmm_to_minutes(hhmm: str) -> int:
+    """'08:30' → 510 (minutes since midnight)."""
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def _current_minutes() -> int:
+    now = time.localtime()
+    return now.tm_hour * 60 + now.tm_min
+
+
+def _get_current_window_idx(config: dict) -> int | None:
+    """返回当前时间所在的 active_window 索引；不在任何 window 返回 None。
+    active_windows_enabled=false 时返回 0（视为永远在第 1 段，等价于不限）。"""
+    if not config.get("active_windows_enabled"):
+        return 0
+    windows = config.get("active_windows") or []
+    if not windows:
+        return 0
+    now_min = _current_minutes()
+    for i, w in enumerate(windows):
+        start_m = _hhmm_to_minutes(w[0])
+        end_m = _hhmm_to_minutes(w[1])
+        if start_m <= now_min < end_m:
+            return i
+    return None
+
+
+def _wait_for_active_window(config: dict):
+    """如果当前不在 active_window，sleep 到下一段开始。
+    active_windows_enabled=false 时直接返回。"""
+    if not config.get("active_windows_enabled"):
+        return
+    windows = config.get("active_windows") or []
+    if not windows:
+        return
+    if _get_current_window_idx(config) is not None:
+        return  # 在 window 内
+
+    now_min = _current_minutes()
+    sec_into_min = time.localtime().tm_sec
+    starts = [_hhmm_to_minutes(w[0]) for w in windows]
+
+    future_today = [s for s in starts if s > now_min]
+    if future_today:
+        target_min = min(future_today)
+        wait_sec = (target_min - now_min) * 60 - sec_into_min
+        target_label = f"今日 {target_min // 60:02d}:{target_min % 60:02d}"
+    else:
+        # 今天 window 都过了，等明天第一段
+        target_min = min(starts)
+        rest_today_sec = (24 * 60 - now_min) * 60 - sec_into_min
+        wait_sec = rest_today_sec + target_min * 60
+        target_label = f"明日 {target_min // 60:02d}:{target_min % 60:02d}"
+
+    win_str = " / ".join(f"{w[0]}-{w[1]}" for w in windows)
+    print(f"\n⏸ 当前不在 active_window ({win_str})；idle 到 {target_label}（约 {wait_sec/60:.0f} min）...")
+    time.sleep(max(wait_sec, 1))
+    print(f"▶ 进入 active_window，恢复运行")
+
 
 def _check_rate_limit(page, account: str) -> bool:
     """检测当前 URL 是否含 风控 重定向信号。
@@ -290,6 +381,129 @@ def _random_scroll(page):
     scroll_distance = random.randint(200, 600)
     page.mouse.wheel(0, scroll_distance)
     time.sleep(random.uniform(0.5, 1.5))
+
+
+# ============================================================
+#  P1/P2 仿人工 helpers
+# ============================================================
+
+def _read_note_like_human(page, min_sec: float = 30.0, max_sec: float = 90.0):
+    """P1-1 评论前阅读停留：30-90s 内滚 1-3 次模拟看笔记正文。
+
+    替换之前 line 675 的 ``_human_delay(2, 5)``——2-5s 是机器味，
+    真实读者打开图文笔记会停 30s+ 看图看文，期间会上下滚动。
+    """
+    duration = random.uniform(min_sec, max_sec)
+    end = time.time() + duration
+    n_scrolls = random.randint(1, 3)
+    interval = duration / (n_scrolls + 1)
+    for _ in range(n_scrolls):
+        time.sleep(max(interval + random.uniform(-3, 3), 1.0))
+        try:
+            page.mouse.wheel(0, random.randint(200, 600))
+        except Exception:
+            pass
+    remaining = end - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _browse_search_results_like_human(page):
+    """P1-3 搜索结果页：滚 1-3 次模拟浏览瀑布流，再选 top 笔记。
+
+    当前代码只 _human_delay(3,6) + _random_scroll 一次——加 1-3 次随机滚 + 间隔停留，
+    模拟真人扫瀑布流的节奏。"""
+    n = random.randint(1, 3)
+    for _ in range(n):
+        try:
+            page.mouse.wheel(0, random.randint(300, 700))
+        except Exception:
+            pass
+        time.sleep(random.uniform(1.5, 3.5))
+
+
+def _human_click(page, locator, fallback_to_locator_click: bool = True):
+    """P2-1 鼠标轨迹仿真：取元素 bounding_box → mouse.move 走 2-4 步分段直线 → click。
+
+    替换关键 ``locator.click()`` 调用（如卡片点击、评论目标点击、发送按钮）。
+    Playwright 默认 click 是 teleport 到坐标——风控可能识别"无 mousemove 就 click"
+    作为机器人特征。
+
+    fallback：拿不到 bounding_box 时退回 locator.click()。"""
+    try:
+        box = locator.bounding_box()
+        if not box:
+            raise ValueError("no bounding_box")
+        # 在元素中心附近随机偏移 ±3px
+        target_x = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+        target_y = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+        # 从一个随机起点 mousemove 到目标，分 2-4 步（Playwright 自带 steps 参数）
+        viewport = page.viewport_size or {"width": 1280, "height": 800}
+        start_x = random.uniform(0, viewport["width"])
+        start_y = random.uniform(0, viewport["height"])
+        page.mouse.move(start_x, start_y)
+        time.sleep(random.uniform(0.05, 0.15))
+        steps = random.randint(2, 4)
+        page.mouse.move(target_x, target_y, steps=steps)
+        time.sleep(random.uniform(0.1, 0.3))
+        page.mouse.click(target_x, target_y)
+    except Exception as e:
+        if fallback_to_locator_click:
+            try:
+                locator.click()
+            except Exception:
+                raise e
+        else:
+            raise
+
+
+def _idle_browse_explore(page):
+    """P2-2 混入无关浏览：跳到 explore mousewheel 滚 5-10 屏 + 随机点开 1-2 篇看 30-60s 不评。
+
+    每发 5-7 条评论触发一次。模拟真人不可能"只发评论不刷推荐流"——
+    没有这种行为画像在 XHS 是高度异常的。"""
+    print(f"  💭 [仿人工] 穿插刷一轮 explore，不评论...")
+    try:
+        page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
+        time.sleep(random.uniform(3, 6))
+        for _ in range(random.randint(5, 10)):
+            try:
+                page.mouse.wheel(0, random.randint(400, 900))
+            except Exception:
+                pass
+            time.sleep(random.uniform(0.8, 2.5))
+        # 随机点开 1-2 篇看
+        n_browse = random.randint(1, 2)
+        cards = page.locator("section.note-item").all()
+        if cards:
+            pool = cards[:min(20, len(cards))]
+            sample = random.sample(pool, min(n_browse, len(pool)))
+            for c in sample:
+                try:
+                    _human_click(page, c)
+                    page.wait_for_selector(
+                        ".comment-item, .note-container, .note-detail-mask", timeout=8000
+                    )
+                    # 看笔记 30-60s + 期间滚动
+                    end = time.time() + random.uniform(30, 60)
+                    while time.time() < end:
+                        try:
+                            page.mouse.wheel(0, random.randint(200, 500))
+                        except Exception:
+                            pass
+                        time.sleep(random.uniform(2, 5))
+                    page.keyboard.press("Escape")
+                    time.sleep(random.uniform(2, 5))
+                except Exception as e:
+                    print(f"  💭 [仿人工] 浏览单篇出错: {e}")
+                    try:
+                        page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    time.sleep(2)
+        print(f"  💭 [仿人工] 完成无关浏览，回主流程")
+    except Exception as e:
+        print(f"  💭 [仿人工] _idle_browse_explore 整体出错: {e}")
 
 def _check_visibility_and_record(page, account: str, reply_content: str):
     """评论发出后 30-60s 回查可见性；连续 3 次不可见走 warning 阶梯。
@@ -450,10 +664,64 @@ def _run_main(account: str, persona: dict):
         all_responses = []
         total_replies = 0
         round_number = 0
+        # P2-2 下次混入无关浏览的触发阈值（每 5-7 条评论触发一次）
+        _next_browse_trigger = random.randint(5, 7)
+
+        # P0-1 时段散布初始化：把 day_limit 切成 N 段配额
+        # 跨 bot 重启时按"启动时已发数 + 当前所在段"粗估各段已用配额
+        _ws_state = account_state.load(account)
+        _ws_day_limit = _ws_state.get("day_limit", 30)
+        _ws_day_count_at_start = _ws_state.get("day_count", 0) or 0
+        _ws_windows = config.get("active_windows") or []
+        _ws_enabled = bool(config.get("active_windows_enabled")) and bool(_ws_windows)
+        if _ws_enabled:
+            _n_w = len(_ws_windows)
+            _per_w = _ws_day_limit // _n_w
+            window_quotas = [_per_w] * _n_w
+            window_quotas[-1] = _ws_day_limit - _per_w * (_n_w - 1)  # 余数加最后一段
+            # 估算各段已发：假设当前段之前的段都满额
+            _cur_idx = _get_current_window_idx(config)
+            window_sent = [0] * _n_w
+            if _cur_idx is None:
+                # 启动时不在任何 window
+                _filled = _ws_day_count_at_start
+                for i in range(_n_w):
+                    take = min(window_quotas[i], _filled)
+                    window_sent[i] = take
+                    _filled -= take
+            else:
+                for i in range(_cur_idx):
+                    window_sent[i] = window_quotas[i]
+                window_sent[_cur_idx] = max(0, _ws_day_count_at_start - sum(window_quotas[:_cur_idx]))
+            print(f"[时段散布] 启用 active_windows={_ws_windows}")
+            print(f"[时段散布] day_limit={_ws_day_limit} → 各段配额={window_quotas}")
+            print(f"[时段散布] 启动时各段已发估算={window_sent}（基于 day_count={_ws_day_count_at_start}）")
+        else:
+            window_quotas = []
+            window_sent = []
+            print(f"[时段散布] 未启用（active_windows_enabled=false 或 active_windows 为空）")
 
         try:
             while True:
                 round_number += 1
+
+                # P0-1 在 round 顶部 wait（如果不在 window 就 idle 到下一段）
+                _wait_for_active_window(config)
+
+                # P0-1 当前 window 配额检查；满额就跳到下一 window
+                if _ws_enabled:
+                    _cur_idx = _get_current_window_idx(config)
+                    if _cur_idx is not None and window_sent[_cur_idx] >= window_quotas[_cur_idx]:
+                        print(f"\n⏸ 当前段（{_ws_windows[_cur_idx][0]}-{_ws_windows[_cur_idx][1]}）"
+                              f"配额已满 ({window_sent[_cur_idx]}/{window_quotas[_cur_idx]})；"
+                              f"等到下一段...")
+                        # 把当前时间 fast-forward 到当前 window 末尾，让 _wait_for_active_window 正确跳段
+                        _w_end = _hhmm_to_minutes(_ws_windows[_cur_idx][1])
+                        _now_m = _current_minutes()
+                        _slip = max((_w_end - _now_m) * 60 - time.localtime().tm_sec, 1)
+                        time.sleep(_slip)
+                        _wait_for_active_window(config)
+
                 keywords = get_next_keyword_batch(config, keywords_data, round_number)
                 if not keywords:
                     time.sleep(10)
@@ -461,7 +729,7 @@ def _run_main(account: str, persona: dict):
 
                 for kw_idx, keyword in enumerate(keywords, start=1):
                     print(f"\n{'─' * 50}\n[第{round_number}轮 {kw_idx}/{len(keywords)}] 🔍 搜索关键词: 「{keyword}」")
-                    
+
                     # 检测限流
                     _check_rate_limit(page, account)
                     
@@ -496,9 +764,9 @@ def _run_main(account: str, persona: dict):
                             continue
                         continue
 
-                    # 给点时间让瀑布流渲染完毕，模拟浏览
+                    # P1-3 搜索结果页：滚 1-3 次模拟浏览瀑布流
                     _human_delay(3, 6)
-                    _random_scroll(page)
+                    _browse_search_results_like_human(page)
                     cards = page.locator("section.note-item").all()
                     top_feeds = cards[:post_per_keyword]
                     print(f"  -> 共渲染了 {len(cards)} 篇笔记，将查看前 {len(top_feeds)} 篇。")
@@ -526,10 +794,12 @@ def _run_main(account: str, persona: dict):
                         # 纯人工模拟：点击卡片进入详情浮层
                         _human_delay(1.5, 3.5)  # 阅读标题后再点击
                         try:
-                            card.click()
+                            # P2-1 鼠标轨迹仿真 click（vs teleport）
+                            _human_click(page, card)
                             # 详情页出现
                             page.wait_for_selector(".comment-item, .note-container, .note-detail-mask", timeout=10000)
-                            _human_delay(2, 5)  # 模拟阅读笔记内容
+                            # P1-1 阅读停留 30-90s + 滚 1-3 次（替代之前 _human_delay(2,5)）
+                            _read_note_like_human(page)
                             if _check_rate_limit(page, account):
                                 continue
                         except Exception as e:
@@ -564,9 +834,12 @@ def _run_main(account: str, persona: dict):
                             time.sleep(1)
                             continue
 
-                        # 让 LLM 分析
+                        # 让 LLM 分析（传 note_title 让 LLM 能针对帖子主题生成 hook，
+                        # 避免 D3 那种"dd → 这种心情我挺懂的"式空泛共情）
                         print(f"    -> 分析 {len(comments_data)} 条评论...")
-                        llm_result = evaluate_comments_with_llm(comments_data, persona)
+                        llm_result = evaluate_comments_with_llm(
+                            comments_data, persona, note_title=title or ""
+                        )
                         if not llm_result:
                             page.keyboard.press("Escape")
                             time.sleep(1)
@@ -625,17 +898,33 @@ def _run_main(account: str, persona: dict):
                                 target_element.click()
                             time.sleep(1)
 
-                            # 2. 填写输入框（基于真实 DOM）
+                            # 2. 填写输入框：用逐字打字仿真而不是 fill 瞬间填入。
+                            # fill 是一次性 setValue，DOM 上只触发一个 input 事件；
+                            # 真实人类打字会触发逐键 keydown/keypress/input/keyup 序列，
+                            # 风控可能用这个时序差异作为机器号信号。
                             input_box = page.locator("#content-textarea").first
-                            input_box.fill(reply_content)
-                            time.sleep(1)
+                            input_box.click()
+                            time.sleep(random.uniform(0.6, 1.2))  # 点击输入框后短停（假装聚焦/思考）
+                            for ch in reply_content:
+                                page.keyboard.type(ch)
+                                time.sleep(random.uniform(0.06, 0.13))  # 60-130ms 每字，含字符级抖动
+                            time.sleep(random.uniform(0.8, 1.8))  # 写完通读一遍再点发送
 
                             # 3. 发送（基于真实 DOM）
+                            # P2-1 鼠标轨迹仿真 click 发送按钮
                             send_btn = page.locator("button.btn.submit").first
-                            send_btn.click()
+                            _human_click(page, send_btn)
                             print("    -> ✅ 回复操作已模拟完成！")
                             account_state.record_send(account)
                             total_replies += 1
+                            # P0-1 当前段已发计数 ++（window 内累计；跨日 bot 重启会重新估算）
+                            if _ws_enabled:
+                                _cur_idx_send = _get_current_window_idx(config)
+                                if _cur_idx_send is not None:
+                                    window_sent[_cur_idx_send] += 1
+                                    print(f"    -> [时段] 当前段 ({_ws_windows[_cur_idx_send][0]}-"
+                                          f"{_ws_windows[_cur_idx_send][1]}) 已发 "
+                                          f"{window_sent[_cur_idx_send]}/{window_quotas[_cur_idx_send]}")
 
                             # 记录结果
                             all_responses.append({
@@ -652,6 +941,14 @@ def _run_main(account: str, persona: dict):
                             # 在当前笔记浮层停留 30-60s 模拟自然浏览，再读评论区
                             # 找回复前缀；连续 3 次找不到 → 走 warning 阶梯
                             _check_visibility_and_record(page, account, reply_content)
+
+                            # P2-2 每发 5-7 条评论穿插一次"刷推荐流不评论"
+                            # 真人不会"只发评论不刷"——加上这条让活动画像维度跟真人对齐
+                            if total_replies >= _next_browse_trigger:
+                                page.keyboard.press("Escape")
+                                time.sleep(random.uniform(2, 4))
+                                _idle_browse_explore(page)
+                                _next_browse_trigger = total_replies + random.randint(5, 7)
 
                         except Exception as e:
                             print(f"    -> ❌ 模拟回复失败: {e}")
